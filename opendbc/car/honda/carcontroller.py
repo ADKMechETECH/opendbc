@@ -792,22 +792,11 @@ class CarController(CarControllerBase, MadsCarController, GasInterceptorCarContr
       alpha_eff = sum(w * self.speed_alphas[band] for band, w in speed_w.items())
       # TODO this 1.44 is just to maintain previous behavior
       if not CC.longActive:
-        if CC.enabled and CS.out.gasPressed and CS.car_gas_available:
-          # driver-gas override: mirror the applied pedal onto the wire instead of zeroing it.
-          # Stock keeps commanding through overrides (PCM_SPEED = set speed, PCM_GAS nonzero);
-          # zeroing instead told the PCM "no torque" for the whole override, so its internal pedal
-          # tracker unwound to zero and the release started from scratch (routes 33/34: pedal
-          # stayed 0 until ~2s after release; at t=288.5 the commanded zero-torque second even
-          # dropped the engine into idle-stop while moving, adding restart lag). The mirror also
-          # keeps prior_gas_average — the model of the PCM's smoothed command — tracking the true
-          # operating point through the override, and seeds the release rise clip from it.
-          # moved to "not CC.longActive" block because powertrain sets ACC_STATUS = 0 when gasPressed
-          # set pcm_speed to current speed + 9 to mirror stock
-          pcm_speed = float(np.clip(CS.out.vEgo, 0.0, 100.0))
-          pcm_accel = int(np.clip(CS.car_gas / max(self.car_gas_per_pcm_gas, 1e-3), 0.0, self.params.NIDEC_GAS_MAX))
-        else:
-          pcm_speed = 0.0
-          pcm_accel = int(0.0)
+        # Stock panda safety only allows an all-zero ACC_HUD while longitudinal is not allowed (incl. a driver
+        # gas override), so send zeros. MVL mirrored the driver's pedal here behind a panda exemption; both
+        # were reverted to restore the stock safety limit.
+        pcm_speed = 0.0
+        pcm_accel = int(0.0)
       else:
         if self.launch_active:
           # stock-shaped launch lead (stock uses 9.99 kph): the general sf*accel+alpha lead is both
@@ -1184,12 +1173,8 @@ class CarController(CarControllerBase, MadsCarController, GasInterceptorCarContr
             can_sends.extend(GasInterceptorCarController.update(self, CC, CS, gas * self.gasfactor, brake, wind_brake, self.packer, self.frame))
             self.gasint_nolearn_ticks = max(0, self.gasint_nolearn_ticks - 1)
 
-          # during a driver-gas override the wire now carries the pedal mirror set above, so
-          # the PCM tracker (and the feedforward state) stay wound to the true operating
-          # point; platforms without GAS_PEDAL_2 keep the old zeroing since there is nothing
-          # to mirror. (A previous branch here set 198 during gasPressed and was immediately
-          # overwritten by the zeroing below — dead code, removed.)
-          if (apply_brake > 0) or (CS.out.gasPressed and not CS.car_gas_available):
+          # zero the wire during a driver-gas override: stock panda safety only allows an all-zero ACC_HUD then
+          if (apply_brake > 0) or CS.out.gasPressed:
             self.new_accel = 0
 
           # openpilot brake release: the guard above held the wire at 0 for the whole brake

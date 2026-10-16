@@ -332,19 +332,21 @@ class TestHondaNidecSafetyBase(HondaBase):
           send = (controls_allowed and pcm_gas <= self.MAX_GAS) or (pcm_gas == 0 and pcm_speed == 0)
           self.assertEqual(send, self._tx(self._send_acc_hud_msg(pcm_gas, pcm_speed)))
 
-  def test_acc_hud_gas_pressed_passthrough(self):
-    # the carcontroller mirrors the driver's pedal onto ACC_HUD during a gas override; blocking it
-    # makes the PCM drop ACC_STATUS, so the speed/gas checks are waived while the pedal is pressed
+  def test_acc_hud_blocked_while_gas_pressed(self):
+    # Stock limits: while the driver is on the gas, longitudinal is not allowed and only an all-zero ACC_HUD may
+    # be sent. (MVL had waived these checks during a gas override, letting any PCM_GAS through - even > MAX_GAS.)
     self.safety.set_controls_allowed(True)
     self._driver_gas_on()
     self.assertTrue(self.safety.get_gas_pressed_prev())
     for pcm_gas in (0, 1, self.MAX_GAS, 255):
       for pcm_speed in (0, 1, 99):
-        self.assertTrue(self._tx(self._send_acc_hud_msg(pcm_gas, pcm_speed)))
+        self.assertEqual(pcm_gas == 0 and pcm_speed == 0, self._tx(self._send_acc_hud_msg(pcm_gas, pcm_speed)),
+                         (pcm_gas, pcm_speed))
 
     # pedal released: back to the standard limits
     self._driver_gas_off()
     self.assertFalse(self.safety.get_gas_pressed_prev())
+    self.safety.set_controls_allowed(True)
     self.assertTrue(self._tx(self._send_acc_hud_msg(self.MAX_GAS, 99)))
     self.assertFalse(self._tx(self._send_acc_hud_msg(self.MAX_GAS + 1, 0)))
     self.safety.set_controls_allowed(False)
@@ -523,7 +525,7 @@ class TestHondaNidecStockLongitudinalSafety(HondaPcmEnableBase, TestHondaNidecSa
   def test_acc_hud_safety_check(self):
     pass
 
-  def test_acc_hud_gas_pressed_passthrough(self):
+  def test_acc_hud_blocked_while_gas_pressed(self):
     pass
 
   def test_fwd_hook(self):
@@ -747,6 +749,13 @@ class TestHondaBoschLongSafety(HondaButtonEnableBase, TestHondaBoschSafetyBase):
         self.safety.set_controls_allowed(controls_allowed)
         send = (controls_allowed and 0 <= gas <= self.MAX_GAS) or gas == self.NO_GAS
         self.assertEqual(send, self._tx(self._send_gas_brake_msg(gas, accel)), (controls_allowed, gas, accel))
+
+  def test_gas_limit_independent_of_accel(self):
+    # test_gas_safety_check couples accel = gas/1000, so any gas > 2000 also breaks the 2.0 m/s^2 accel limit and the
+    # gas limit itself is never exercised (that hid MVL's 2000 -> 2200 raise). Hold accel valid and pin gas exactly.
+    self.safety.set_controls_allowed(True)
+    for gas in range(self.MAX_GAS - 300, self.MAX_GAS + 301, 10):
+      self.assertEqual(gas <= self.MAX_GAS, self._tx(self._send_gas_brake_msg(gas, 0.5)), gas)
 
   def test_brake_safety_check(self):
     for controls_allowed in [True, False]:

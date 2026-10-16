@@ -223,6 +223,15 @@ class CarState(CarStateBase, CarStateExt):
 
     if self.CP.transmissionType == TransmissionType.manual:
       ret.gearShifter = GearShifter.reverse if bool(cp.vl[self.car_state_scm_msg]["REVERSE_LIGHT"]) else GearShifter.drive
+
+      # GEARBOX_ALT_2 only exists in the radarless DBC. clutchPressed/engineRpm are pre-existing slots in
+      # CarState's deprecated group, reused so no cereal schema change is needed.
+      if self.CP.flags & HondaFlags.BOSCH_RADARLESS:
+        # GEAR_MT is the PCM's inferred gear (0=Clutch/no gear meshed, 1-6=gear, 14=reverse), not a raw clutch switch.
+        # TODO(on-car): verify GEAR_MT values and timing vs. real clutch travel (and true neutral at a stop) in cabana.
+        ret.deprecated.clutchPressed = int(cp.vl["GEARBOX_ALT_2"]["GEAR_MT"]) == 0
+        # TODO(on-car): verify ENGINE_RPM needs no extra scaling (DBC: scale 1, offset 0, rpm) against the tach in cabana.
+        ret.deprecated.engineRpm = cp.vl["ENGINE_DATA"]["ENGINE_RPM"]
     else:
       gear_position = self.shifter_values.get(cp.vl[self.gearbox_msg]["GEAR_SHIFTER"], None)
       ret.gearShifter = self.parse_gear_shifter(gear_position)

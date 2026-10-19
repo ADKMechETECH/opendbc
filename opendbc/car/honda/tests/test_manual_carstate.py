@@ -139,6 +139,86 @@ class TestCanValid(unittest.TestCase):
     self.assertTrue(run_bus(CP, CS, parsers))
 
 
+class TestGearboxAlt2PresentButBad(unittest.TestCase):
+  """Task 13 A3 [review2 N2]: 0x1DD arriving with a bad counter or checksum reads not-live (the clutch features go
+  inert), and never invalidates CAN for the car — the counterpart of the absent-0x1DD canValid test above."""
+
+  def setUp(self):
+    self.CP, self.CS, self.parsers = build_car_state(CAR.HONDA_CIVIC_2022, gen_empty_fingerprint())
+    self.CS.update(self.parsers)
+    self.packers = {b: CANPacker(cp.dbc_name) for b, cp in self.parsers.items()}
+    self.i = 0
+
+  def frame(self, counter=None, bad_checksum=False, gear_mt=4):
+    """One 100 Hz frame of every subscribed message (valid) plus 0x1DD as given; returns (canValid, CarStateSP)."""
+    self.i += 1
+    t = int(self.i * 1e7)
+    for b, cp in self.parsers.items():
+      msgs = [self.packers[b].make_can_msg(addr, cp.bus, {}) for addr in cp.message_states if addr != 0x1DD]
+      if b == Bus.pt:
+        vals = {"GEAR_MT": gear_mt} if counter is None else {"GEAR_MT": gear_mt, "COUNTER": counter}
+        addr, dat, bus = self.packers[b].make_can_msg("GEARBOX_ALT_2", cp.bus, vals)
+        if bad_checksum:
+          dat = bytearray(dat)
+          dat[7] ^= 0x0F   # CHECKSUM is bits 59..56 (byte 7, low nibble)
+          dat = bytes(dat)
+        msgs.append((addr, dat, bus))
+      cp.update([t, msgs])
+    _, sp = self.CS.update(self.parsers)
+    return all(cp.can_valid for cp in self.parsers.values()), sp
+
+  def test_clean_is_live(self):
+    for _ in range(50):
+      valid, sp = self.frame()
+    self.assertTrue(valid)
+    self.assertTrue(sp.clutchSignalValid)
+    self.assertEqual(sp.gearRaw, 4)
+
+  def test_corrupt_counter_not_live_can_still_valid(self):
+    for _ in range(50):
+      self.frame()
+    for i in range(100):   # 1 s of a stuck counter (the parser alone would invalidate CAN after 5 frames)
+      valid, sp = self.frame(counter=0)
+      self.assertTrue(valid, f"canValid dropped at frame {i}")
+      if i >= 1:
+        self.assertFalse(sp.clutchSignalValid, f"live with a bad counter at frame {i}")
+        self.assertEqual(sp.gearRaw, -1)
+    # counters clean again: live after the bad-counter score decays (a few frames), never invalid CAN
+    for _ in range(20):
+      valid, sp = self.frame()
+      self.assertTrue(valid)
+    self.assertTrue(sp.clutchSignalValid)
+
+  def test_single_counter_skip_recovers(self):
+    for _ in range(20):
+      self.frame()
+    _, sp = self.frame(counter=2)   # the packer's sequence is at 20 % 4 == 0: a skip
+    self.assertFalse(sp.clutchSignalValid)
+    valid, sp = self.frame(counter=3)
+    self.assertTrue(valid)
+    self.assertTrue(sp.clutchSignalValid, "one clean frame clears a single skip")
+
+  def test_bad_checksum_not_live_at_once_can_still_valid(self):
+    for _ in range(50):
+      self.frame()
+    valid, sp = self.frame(bad_checksum=True, gear_mt=0)
+    self.assertTrue(valid)
+    self.assertFalse(sp.clutchSignalValid, "not live from the first bad frame (not after the 250 ms timeout)")
+    for _ in range(100):
+      valid, sp = self.frame(bad_checksum=True, gear_mt=0)
+      self.assertTrue(valid)
+      self.assertFalse(sp.clutchSignalValid)
+    for _ in range(15):    # clean frames for > the 100 ms reject hold
+      valid, sp = self.frame()
+    self.assertTrue(valid)
+    self.assertTrue(sp.clutchSignalValid)
+
+  def test_counter_ignored_only_for_gearbox_alt_2(self):
+    pt = self.parsers[Bus.pt]
+    self.assertTrue(pt.message_states[0x1DD].ignore_counter)
+    self.assertFalse(any(st.ignore_counter for addr, st in pt.message_states.items() if addr != 0x1DD))
+
+
 class TestIntegraManual(unittest.TestCase):
   def test_integra_manual_reads_rpm_from_powertrain_data(self):
     # Task 12 B5 [C-13]: the Integra has no ENGINE_DATA; reading it would subscribe a message that never arrives

@@ -20,7 +20,10 @@ BUTTONS_DICT = {CruiseButtons.RES_ACCEL: ButtonType.accelCruise, CruiseButtons.D
                 CruiseButtons.MAIN: ButtonType.mainCruise, CruiseButtons.CANCEL: ButtonType.cancel}
 SETTINGS_BUTTONS_DICT = {CruiseSettings.DISTANCE: ButtonType.gapAdjustCruise, CruiseSettings.LKAS: ButtonType.lkas}
 GEAR_MT_COUPLED = (1, 2, 3, 4, 5, 6, 14)   # GEARBOX_ALT_2.GEAR_MT values with a gear meshed (14 = reverse)
+GEARBOX_ALT_2_ADDR = 0x1DD
 GEARBOX_ALT_2_TIMEOUT_NS = 250_000_000     # GEARBOX_ALT_2 older than this (vs the bus) = clutch signal not alive
+GEARBOX_ALT_2_REJECT_HOLD_NS = 100_000_000  # a GEARBOX_ALT_2 frame dropped for a bad checksum this recently = not alive
+GEARBOX_ALT_2_MAX_BAD_COUNTER = 5           # own counter check (the parser's is off for 0x1DD, see get_can_parsers)
 
 
 class CarState(CarStateBase, CarStateExt):
@@ -34,6 +37,10 @@ class CarState(CarStateBase, CarStateExt):
       if CP.transmissionType == TransmissionType.cvt:
         self.gearbox_msg = "GEARBOX_CVT"
       self.shifter_values = can_define.dv[self.gearbox_msg]["GEAR_SHIFTER"]
+
+    # GEARBOX_ALT_2 counter check (manual radarless): last COUNTER seen and the bad-counter score (0 = clean)
+    self.gearbox_alt_2_counter: int | None = None
+    self.gearbox_alt_2_counter_fail = 0
 
     self.car_state_scm_msg = "SCM_FEEDBACK"
     if CP.flags & HondaFlags.NIDEC_ALT_SCM_MESSAGES:
@@ -237,7 +244,20 @@ class CarState(CarStateBase, CarStateExt):
         # TODO(on-car): verify GEAR_MT values and timing vs. real clutch travel (and true neutral at a stop) in cabana.
         gear_mt = int(cp.vl["GEARBOX_ALT_2"]["GEAR_MT"])
         ts = cp.ts_nanos["GEARBOX_ALT_2"]["GEAR_MT"]
-        ret_sp.clutchSignalValid = ts > 0 and (cp.last_nonempty_nanos - ts) < GEARBOX_ALT_2_TIMEOUT_NS
+        # Task 13 A3 [review2 N2]: alive means fresh AND clean — not live while frames arrive with a bad checksum (the
+        # parser drops them; last_rejected_nanos says so) or a bad counter (checked here: the parser's own counter check
+        # is off for 0x1DD so a bad counter can never invalidate CAN for the whole car)
+        for counter in cp.vl_all["GEARBOX_ALT_2"]["COUNTER"]:
+          counter = int(counter)
+          if self.gearbox_alt_2_counter is not None and counter != (self.gearbox_alt_2_counter + 1) % 4:
+            self.gearbox_alt_2_counter_fail = min(self.gearbox_alt_2_counter_fail + 1, GEARBOX_ALT_2_MAX_BAD_COUNTER)
+          elif self.gearbox_alt_2_counter_fail > 0:
+            self.gearbox_alt_2_counter_fail -= 1
+          self.gearbox_alt_2_counter = counter
+        rejected = cp.message_states[GEARBOX_ALT_2_ADDR].last_rejected_nanos
+        ret_sp.clutchSignalValid = ts > 0 and (cp.last_nonempty_nanos - ts) < GEARBOX_ALT_2_TIMEOUT_NS and \
+                                   self.gearbox_alt_2_counter_fail == 0 and \
+                                   (rejected == 0 or (cp.last_nonempty_nanos - rejected) >= GEARBOX_ALT_2_REJECT_HOLD_NS)
         ret_sp.gearRaw = gear_mt if ret_sp.clutchSignalValid else -1
         ret.deprecated.clutchPressed = gear_mt not in GEAR_MT_COUPLED
         # TODO(on-car): verify ENGINE_RPM needs no extra scaling (DBC: scale 1, offset 0, rpm) against the tach in cabana.
@@ -447,6 +467,10 @@ class CarState(CarStateBase, CarStateExt):
       Bus.pt: CANParser(DBC[CP.carFingerprint][Bus.pt], pt_messages, CanBus(CP).pt),
       Bus.cam: CANParser(DBC[CP.carFingerprint][Bus.pt], cam_messages, CanBus(CP).camera),
     }
+    if self.CP.flags & HondaFlags.BOSCH_RADARLESS and CP.transmissionType == TransmissionType.manual:
+      # Task 13 A3: nor may a bad GEARBOX_ALT_2 counter (the parser's counter failures invalidate CAN even with NaN
+      # frequency); update() checks the counter itself and reports it through clutchSignalValid
+      parsers[Bus.pt].message_states[GEARBOX_ALT_2_ADDR].ignore_counter = True
     if CP.enableBsm:
       parsers[Bus.body] = CANParser(DBC[CP.carFingerprint][Bus.body], [], CanBus(CP).radar)
     if self.CP.flags & HondaFlags.BOSCH_CANFD:

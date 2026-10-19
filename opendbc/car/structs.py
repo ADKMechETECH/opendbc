@@ -166,3 +166,8 @@ class CarControlSP:
 @auto_dataclass
 class CarStateSP:
   speedLimit: float = auto_field()
+  # fork-only (civic-cruise): the manual gearbox's own gear signal (Honda radarless: GEARBOX_ALT_2.GEAR_MT) and whether
+  # that message is alive. A missing message would read as GEAR_MT 0 (= clutch pressed), so consumers stay inert while
+  # clutchSignalValid is False.
+  gearRaw: int = auto_field()
+  clutchSignalValid: bool = auto_field()

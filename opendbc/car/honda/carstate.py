@@ -19,6 +19,8 @@ ButtonType = structs.CarState.ButtonEvent.Type
 BUTTONS_DICT = {CruiseButtons.RES_ACCEL: ButtonType.accelCruise, CruiseButtons.DECEL_SET: ButtonType.decelCruise,
                 CruiseButtons.MAIN: ButtonType.mainCruise, CruiseButtons.CANCEL: ButtonType.cancel}
 SETTINGS_BUTTONS_DICT = {CruiseSettings.DISTANCE: ButtonType.gapAdjustCruise, CruiseSettings.LKAS: ButtonType.lkas}
+GEAR_MT_COUPLED = (1, 2, 3, 4, 5, 6, 14)   # GEARBOX_ALT_2.GEAR_MT values with a gear meshed (14 = reverse)
+GEARBOX_ALT_2_TIMEOUT_NS = 250_000_000     # GEARBOX_ALT_2 older than this (vs the bus) = clutch signal not alive
 
 
 class CarState(CarStateBase, CarStateExt):
@@ -225,13 +227,25 @@ class CarState(CarStateBase, CarStateExt):
       ret.gearShifter = GearShifter.reverse if bool(cp.vl[self.car_state_scm_msg]["REVERSE_LIGHT"]) else GearShifter.drive
 
       # GEARBOX_ALT_2 only exists in the radarless DBC. clutchPressed/engineRpm are pre-existing slots in
-      # CarState's deprecated group, reused so no cereal schema change is needed.
+      # CarState's deprecated group, reused so no cereal schema change is needed; the raw gear and the message's
+      # liveness go in CarStateSP (fork-only fields).
       if self.CP.flags & HondaFlags.BOSCH_RADARLESS:
         # GEAR_MT is the PCM's inferred gear (0=Clutch/no gear meshed, 1-6=gear, 14=reverse), not a raw clutch switch.
+        # Any other value (undocumented 7, 13, 15, ...) counts as decoupled. GEARBOX_ALT_2 is registered with NaN
+        # frequency (get_can_parsers), so its absence never touches canValid; clutchSignalValid says whether it is alive
+        # (a missing message reads as GEAR_MT 0, so the clutch features stay inert without it).
         # TODO(on-car): verify GEAR_MT values and timing vs. real clutch travel (and true neutral at a stop) in cabana.
-        ret.deprecated.clutchPressed = int(cp.vl["GEARBOX_ALT_2"]["GEAR_MT"]) == 0
+        gear_mt = int(cp.vl["GEARBOX_ALT_2"]["GEAR_MT"])
+        ts = cp.ts_nanos["GEARBOX_ALT_2"]["GEAR_MT"]
+        ret_sp.clutchSignalValid = ts > 0 and (cp.last_nonempty_nanos - ts) < GEARBOX_ALT_2_TIMEOUT_NS
+        ret_sp.gearRaw = gear_mt if ret_sp.clutchSignalValid else -1
+        ret.deprecated.clutchPressed = gear_mt not in GEAR_MT_COUPLED
         # TODO(on-car): verify ENGINE_RPM needs no extra scaling (DBC: scale 1, offset 0, rpm) against the tach in cabana.
-        ret.deprecated.engineRpm = cp.vl["ENGINE_DATA"]["ENGINE_RPM"]
+        # The Integra has no ENGINE_DATA (see the speed blend above); POWERTRAIN_DATA carries ENGINE_RPM too.
+        if self.CP.carFingerprint == CAR.ACURA_INTEGRA:
+          ret.deprecated.engineRpm = cp.vl["POWERTRAIN_DATA"]["ENGINE_RPM"]
+        else:
+          ret.deprecated.engineRpm = cp.vl["ENGINE_DATA"]["ENGINE_RPM"]
     else:
       gear_position = self.shifter_values.get(cp.vl[self.gearbox_msg]["GEAR_SHIFTER"], None)
       ret.gearShifter = self.parse_gear_shifter(gear_position)
@@ -426,6 +440,9 @@ class CarState(CarStateBase, CarStateExt):
       # HUD_OBJECTS is polled by the HudObjectTracker, but not every radarless camera emits it,
       # so subscribe with NaN frequency to skip the alive/timeout checks.
       cam_messages += [("HUD_OBJECTS", float('nan'))]
+      if CP.transmissionType == TransmissionType.manual:
+        # manual gear/clutch (fork features only): its absence must never invalidate CAN (CarStateSP.clutchSignalValid)
+        pt_messages += [("GEARBOX_ALT_2", float('nan'))]
     parsers = {
       Bus.pt: CANParser(DBC[CP.carFingerprint][Bus.pt], pt_messages, CanBus(CP).pt),
       Bus.cam: CANParser(DBC[CP.carFingerprint][Bus.pt], cam_messages, CanBus(CP).camera),

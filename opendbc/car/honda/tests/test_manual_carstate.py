@@ -76,6 +76,83 @@ class TestHondaManualCarState(unittest.TestCase):
       with self.subTest(rpm=rpm):
         self.assertAlmostEqual(self._step(3, rpm=rpm).deprecated.engineRpm, rpm)
 
+  def _step_sp(self, gear_mt=None, rpm=0.):
+    """Like _step, but GEARBOX_ALT_2 is optional (None = not on the bus this frame); returns (ret, ret_sp)."""
+    msgs = [self.packer.make_can_msg("ENGINE_DATA", self.bus, {"ENGINE_RPM": rpm}),
+            self.packer.make_can_msg("SCM_FEEDBACK", self.bus, {"REVERSE_LIGHT": 0})]
+    if gear_mt is not None:
+      msgs.append(self.packer.make_can_msg("GEARBOX_ALT_2", self.bus, {"GEAR_MT": gear_mt}))
+    self.t += int(0.01 * 1e9)
+    self.parsers[Bus.pt].update([self.t, msgs])
+    return self.CS.update(self.parsers)
+
+  def test_gearbox_alt_2_never_affects_can_valid(self):
+    # Task 12 B5 [A-F-M6]: registered with NaN frequency -> ignore_alive, so its absence can't invalidate CAN
+    state = self.parsers[Bus.pt].message_states[0x1DD]
+    self.assertTrue(state.ignore_alive)
+
+  def test_clutch_signal_liveness(self):
+    # Task 12 B5 [A-F-M6]: absent -> clutchSignalValid False (and gearRaw -1); a missing frame reads as GEAR_MT 0
+    _, sp = self._step_sp(None)
+    self.assertFalse(sp.clutchSignalValid)
+    self.assertEqual(sp.gearRaw, -1)
+    _, sp = self._step_sp(4, rpm=2000.)
+    self.assertTrue(sp.clutchSignalValid)
+    self.assertEqual(sp.gearRaw, 4)
+    for _ in range(30):   # 0.3 s without GEARBOX_ALT_2 while the bus keeps going
+      ret, sp = self._step_sp(None, rpm=2000.)
+    self.assertFalse(sp.clutchSignalValid)
+    self.assertEqual(sp.gearRaw, -1)
+
+  def test_unknown_gear_mt_values_are_decoupled(self):
+    # Task 12 A2.7 [B-L1]: only 1-6 and 14 have a gear meshed
+    for gear_mt, pressed in ((7, True), (13, True), (15, True), (0, True), (6, False), (14, False)):
+      with self.subTest(gear_mt=gear_mt):
+        self.assertEqual(self._step(gear_mt, rpm=2000.).deprecated.clutchPressed, pressed)
+
+
+def run_bus(CP, CS, parsers, skip=(), seconds=1.0):
+  """Feed every message the parsers subscribed (at 100 Hz, valid counters/checksums) except `skip`; return can_valid."""
+  CS.update(parsers)
+  packers = {b: CANPacker(cp.dbc_name) for b, cp in parsers.items()}
+  for i in range(int(seconds * 100)):
+    t = int((i + 1) * 1e7)
+    for b, cp in parsers.items():
+      msgs = [packers[b].make_can_msg(addr, cp.bus, {}) for addr in cp.message_states if addr not in skip]
+      cp.update([t, msgs])
+    CS.update(parsers)
+  return all(cp.can_valid for cp in parsers.values())
+
+
+class TestCanValid(unittest.TestCase):
+  def test_civic_manual_can_valid_without_gearbox_alt_2(self):
+    # Task 12 B5 [A-F-M6]: 0x1DD absent -> CAN stays valid, the clutch signal is reported dead
+    CP, CS, parsers = build_car_state(CAR.HONDA_CIVIC_2022, gen_empty_fingerprint())
+    self.assertTrue(run_bus(CP, CS, parsers, skip=(0x1DD,)))
+    _, sp = CS.update(parsers)
+    self.assertFalse(sp.clutchSignalValid)
+
+  def test_integra_manual_can_valid(self):
+    # Task 12 B5 [C-13]
+    CP, CS, parsers = build_car_state(CAR.ACURA_INTEGRA, gen_empty_fingerprint())
+    self.assertEqual(CP.transmissionType, TransmissionType.manual)
+    self.assertTrue(run_bus(CP, CS, parsers))
+
+
+class TestIntegraManual(unittest.TestCase):
+  def test_integra_manual_reads_rpm_from_powertrain_data(self):
+    # Task 12 B5 [C-13]: the Integra has no ENGINE_DATA; reading it would subscribe a message that never arrives
+    CP, CS, parsers = build_car_state(CAR.ACURA_INTEGRA, gen_empty_fingerprint())
+    self.assertEqual(CP.transmissionType, TransmissionType.manual)
+    self.assertTrue(CP.flags & HondaFlags.BOSCH_RADARLESS)
+    CS.update(parsers)
+    packer, bus = CANPacker(DBC[CP.carFingerprint][Bus.pt]), CanBus(CP).pt
+    parsers[Bus.pt].update([int(1e7), [packer.make_can_msg("POWERTRAIN_DATA", bus, {"ENGINE_RPM": 2500.}),
+                                       packer.make_can_msg("GEARBOX_ALT_2", bus, {"GEAR_MT": 3})]])
+    ret, sp = CS.update(parsers)
+    self.assertAlmostEqual(ret.deprecated.engineRpm, 2500.)
+    self.assertNotIn(0x158, parsers[Bus.pt].message_states, "ENGINE_DATA must not be subscribed on the Integra")
+
 
 class TestHondaManualSignalsScope(unittest.TestCase):
   """The new signals must not change behavior for automatics/CVTs or for non-radarless manuals."""

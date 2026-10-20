@@ -13,6 +13,8 @@ BO_ 304 GAS_PEDAL_2: 8 PCM
  SG_ ENGINE_TORQUE_ESTIMATE : 7|16@0- (1,0) [-1000|1000] "Nm" EON
  SG_ ENGINE_TORQUE_REQUEST : 23|16@0- (1,0) [-1000|1000] "Nm" EON
  SG_ CAR_GAS : 39|8@0+ (1,0) [0|255] "" EON
+ SG_ CLUTCH_PEDAL_UP : 50|1@0+ (1,0) [0|1] "" EON
+ SG_ CLUTCH_PEDAL_FLOOR : 51|1@0+ (1,0) [0|1] "" EON
  SG_ COUNTER : 61|2@0+ (1,0) [0|3] "" EON
  SG_ CHECKSUM : 59|4@0+ (1,0) [0|15] "" EON
 
@@ -205,6 +207,8 @@ BO_ 1302 ODOMETER: 8 XXX
  SG_ CHECKSUM : 59|4@0+ (1,0) [0|3] "" EON
 
 CM_ SG_ 304 "Seems to be platform-agnostic";
+CM_ SG_ 304 CLUTCH_PEDAL_UP "Manual: clutch pedal fully released (top switch); drops as soon as the pedal starts to move. Observed on the 2024 Civic Hatchback 6MT (Bosch radarless) only";
+CM_ SG_ 304 CLUTCH_PEDAL_FLOOR "Manual: clutch pedal fully depressed (floor switch). Observed on the 2024 Civic Hatchback 6MT (Bosch radarless) only";
 CM_ SG_ 316 "Should exist on Nidec";
 CM_ SG_ 420 BRAKE_HOLD_RELATED "On when Brake Hold engaged";
 CM_ SG_ 427 UNKNOWN_TORQUE_STATE_BIT "Might signal driver input above threshold, for driver inactivity detection";

@@ -3,6 +3,7 @@ import unittest
 from opendbc.can import CANPacker
 from opendbc.car import Bus, gen_empty_fingerprint, structs
 from opendbc.car.honda.hondacan import CanBus
+from opendbc.car.structs import CLUTCH_PEDAL_UNKNOWN, CLUTCH_PEDAL_UP, CLUTCH_PEDAL_TRAVEL, CLUTCH_PEDAL_FLOOR
 from opendbc.car.honda.interface import CarInterface
 from opendbc.car.honda.values import CAR, DBC, HondaFlags
 
@@ -32,17 +33,22 @@ class TestHondaManualCarState(unittest.TestCase):
     # CANParser.vl subscribes messages lazily on first read, so run one update before feeding frames
     self.CS.update(self.parsers)
 
-  def _step(self, gear_mt, rpm=0., reverse_light=False, engine_data_rpm=0.):
+  def _step(self, gear_mt, rpm=0., reverse_light=False, pedal=None):
+    return self._step_full(gear_mt, rpm, reverse_light, pedal)[0]
+
+  def _step_full(self, gear_mt, rpm=0., reverse_light=False, pedal=None, engine_data_rpm=0.):
+    """pedal = (CLUTCH_PEDAL_UP, CLUTCH_PEDAL_FLOOR) switch bits in GAS_PEDAL_2, or None = GAS_PEDAL_2 not sent."""
     msgs = [
       self.packer.make_can_msg("GEARBOX_ALT_2", self.bus, {"GEAR_MT": gear_mt}),
       self.packer.make_can_msg("POWERTRAIN_DATA", self.bus, {"ENGINE_RPM": rpm}),
       self.packer.make_can_msg("ENGINE_DATA", self.bus, {"ENGINE_RPM": engine_data_rpm}),
       self.packer.make_can_msg("SCM_FEEDBACK", self.bus, {"REVERSE_LIGHT": int(reverse_light)}),
     ]
+    if pedal is not None:
+      msgs.append(self.packer.make_can_msg("GAS_PEDAL_2", self.bus, {"CLUTCH_PEDAL_UP": pedal[0], "CLUTCH_PEDAL_FLOOR": pedal[1]}))
     self.t += int(0.01 * 1e9)
     self.parsers[Bus.pt].update([self.t, msgs])
-    ret, _ = self.CS.update(self.parsers)
-    return ret
+    return self.CS.update(self.parsers)
 
   def test_detected_as_manual_radarless(self):
     self.assertEqual(self.CP.transmissionType, TransmissionType.manual)
@@ -111,11 +117,49 @@ class TestHondaManualCarState(unittest.TestCase):
       with self.subTest(gear_mt=gear_mt):
         self.assertEqual(self._step(gear_mt, rpm=2000.).deprecated.clutchPressed, pressed)
 
+  # --- Task 15: rpm source, clutch pedal switches ----------------------------------------------------------------------
+
   def test_rpm_from_powertrain_data_not_engine_data(self):
-    # Task 15 / Stage 1 (2026-10-20): ENGINE_DATA's ENGINE_RPM reads 0 on the car; POWERTRAIN_DATA carries the real rpm
-    self.assertAlmostEqual(self._step(3, rpm=2100., engine_data_rpm=0.).deprecated.engineRpm, 2100.)
-    self.assertAlmostEqual(self._step(3, rpm=2100., engine_data_rpm=4000.).deprecated.engineRpm, 2100.,
-                           msg="ENGINE_DATA must not be read")
+    # Stage 1 (2026-10-20): ENGINE_DATA's ENGINE_RPM reads 0 on the car; POWERTRAIN_DATA carries the real rpm
+    ret, _ = self._step_full(3, rpm=2100., engine_data_rpm=0.)
+    self.assertAlmostEqual(ret.deprecated.engineRpm, 2100.)
+    ret, _ = self._step_full(3, rpm=2100., engine_data_rpm=4000.)
+    self.assertAlmostEqual(ret.deprecated.engineRpm, 2100., msg="ENGINE_DATA must not be read")
+
+  def test_clutch_pedal_decode(self):
+    for bits, want in (((1, 0), CLUTCH_PEDAL_UP), ((0, 0), CLUTCH_PEDAL_TRAVEL), ((0, 1), CLUTCH_PEDAL_FLOOR),
+                       ((1, 1), CLUTCH_PEDAL_UNKNOWN)):
+      with self.subTest(bits=bits):
+        _, sp = self._step_full(4, rpm=2500., pedal=bits)
+        self.assertEqual(sp.clutchPedal, want)
+
+  def test_clutch_pedal_unknown_when_absent_or_stale(self):
+    _, sp = self._step_full(4, rpm=2500.)
+    self.assertEqual(sp.clutchPedal, CLUTCH_PEDAL_UNKNOWN, "never received")
+    _, sp = self._step_full(4, rpm=2500., pedal=(1, 0))
+    self.assertEqual(sp.clutchPedal, CLUTCH_PEDAL_UP)
+    for _ in range(30):   # 0.3 s without GAS_PEDAL_2 while the bus keeps going
+      _, sp = self._step_full(4, rpm=2500.)
+    self.assertEqual(sp.clutchPedal, CLUTCH_PEDAL_UNKNOWN, "stale")
+
+  def test_pedal_switch_leads_gear_mt(self):
+    # the pedal leaving its top switch decouples at once, while GEAR_MT still reports the gear
+    self.assertFalse(self._step(4, rpm=2500., pedal=(1, 0)).deprecated.clutchPressed)
+    self.assertTrue(self._step(4, rpm=2500., pedal=(0, 0)).deprecated.clutchPressed)
+    self.assertTrue(self._step(4, rpm=2500., pedal=(0, 1)).deprecated.clutchPressed)
+    self.assertFalse(self._step(4, rpm=2500., pedal=(1, 0)).deprecated.clutchPressed)
+
+  def test_neutral_clutch_out_is_decoupled_and_distinguishable(self):
+    ret, sp = self._step_full(GEAR_MT_CLUTCH, rpm=850., pedal=(1, 0))
+    self.assertTrue(ret.deprecated.clutchPressed)
+    self.assertEqual(sp.clutchPedal, CLUTCH_PEDAL_UP)        # neutral: pedal up, no gear
+    ret, sp = self._step_full(GEAR_MT_CLUTCH, rpm=850., pedal=(0, 1))
+    self.assertTrue(ret.deprecated.clutchPressed)
+    self.assertEqual(sp.clutchPedal, CLUTCH_PEDAL_FLOOR)     # clutch in
+
+  def test_no_pedal_switch_falls_back_to_gear_mt(self):
+    self.assertFalse(self._step(4, rpm=2500.).deprecated.clutchPressed)
+    self.assertTrue(self._step(GEAR_MT_CLUTCH, rpm=2500.).deprecated.clutchPressed)
 
 
 def run_bus(CP, CS, parsers, skip=(), seconds=1.0):

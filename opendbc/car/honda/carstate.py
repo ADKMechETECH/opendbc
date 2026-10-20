@@ -4,6 +4,7 @@ from collections import defaultdict
 
 from opendbc.can import CANDefine, CANParser
 from opendbc.car import Bus, create_button_events, structs, DT_CTRL
+from opendbc.car.structs import CLUTCH_PEDAL_UNKNOWN, CLUTCH_PEDAL_UP, CLUTCH_PEDAL_TRAVEL, CLUTCH_PEDAL_FLOOR
 from opendbc.car.common.conversions import Conversions as CV
 from opendbc.car.honda.hondacan import CanBus
 from opendbc.car.honda.values import CAR, DBC, STEER_THRESHOLD, HondaFlags, CruiseButtons, CruiseSettings, \
@@ -24,6 +25,7 @@ GEARBOX_ALT_2_ADDR = 0x1DD
 GEARBOX_ALT_2_TIMEOUT_NS = 250_000_000     # GEARBOX_ALT_2 older than this (vs the bus) = clutch signal not alive
 GEARBOX_ALT_2_REJECT_HOLD_NS = 100_000_000  # a GEARBOX_ALT_2 frame dropped for a bad checksum this recently = not alive
 GEARBOX_ALT_2_MAX_BAD_COUNTER = 5           # own counter check (the parser's is off for 0x1DD, see get_can_parsers)
+GAS_PEDAL_2_TIMEOUT_NS = 250_000_000        # GAS_PEDAL_2 older than this = clutch pedal switch not alive
 
 
 class CarState(CarStateBase, CarStateExt):
@@ -259,11 +261,16 @@ class CarState(CarStateBase, CarStateExt):
                                    self.gearbox_alt_2_counter_fail == 0 and \
                                    (rejected == 0 or (cp.last_nonempty_nanos - rejected) >= GEARBOX_ALT_2_REJECT_HOLD_NS)
         ret_sp.gearRaw = gear_mt if ret_sp.clutchSignalValid else -1
-        ret.deprecated.clutchPressed = gear_mt not in GEAR_MT_COUPLED
         # RPM from POWERTRAIN_DATA: ENGINE_DATA's ENGINE_RPM reads 0 on the 2024 Civic 6MT (Stage 1, 2026-10-20), and the
         # Integra has no ENGINE_DATA at all. POWERTRAIN_DATA's matched speed x gear ratio within 0.4 % in every gear.
         rpm = cp.vl["POWERTRAIN_DATA"]["ENGINE_RPM"]
         ret.deprecated.engineRpm = rpm
+        ret_sp.clutchPedal = self.clutch_pedal(cp)
+        # clutchPressed = the drivetrain is decoupled: the pedal has left its top switch (the earliest cue, up to ~0.5 s
+        # before GEAR_MT drops), or GEAR_MT has no gear (clutch in OR neutral with the clutch out).
+        # CarStateSP.clutchPedal tells clutch-in from neutral. Without a live pedal switch: GEAR_MT alone, as before.
+        pedal_pressed = ret_sp.clutchPedal in (CLUTCH_PEDAL_TRAVEL, CLUTCH_PEDAL_FLOOR)
+        ret.deprecated.clutchPressed = pedal_pressed or gear_mt not in GEAR_MT_COUPLED
     else:
       gear_position = self.shifter_values.get(cp.vl[self.gearbox_msg]["GEAR_SHIFTER"], None)
       ret.gearShifter = self.parse_gear_shifter(gear_position)
@@ -440,6 +447,21 @@ class CarState(CarStateBase, CarStateExt):
       self.hud_object_tracker.update(cp_cam)
 
     return ret, ret_sp
+
+  @staticmethod
+  def clutch_pedal(cp) -> int:
+    """Manual radarless: the clutch pedal switches in GAS_PEDAL_2 byte 6 (CLUTCH_PEDAL_UP = fully released, drops as
+    soon as the pedal moves; CLUTCH_PEDAL_FLOOR = fully down). GAS_PEDAL_2 is registered with NaN frequency, so a
+    missing / stale message reads CLUTCH_PEDAL_UNKNOWN instead of touching canValid; both switches on is not a pedal
+    position, so it reads unknown too.
+    TODO(on-car): seen on one car / one drive (Stage 1, 2026-10-20) - confirm in cabana with the pedal moved slowly."""
+    ts = cp.ts_nanos["GAS_PEDAL_2"]["CLUTCH_PEDAL_UP"]
+    if ts <= 0 or (cp.last_nonempty_nanos - ts) >= GAS_PEDAL_2_TIMEOUT_NS:
+      return CLUTCH_PEDAL_UNKNOWN
+    up, floor = bool(cp.vl["GAS_PEDAL_2"]["CLUTCH_PEDAL_UP"]), bool(cp.vl["GAS_PEDAL_2"]["CLUTCH_PEDAL_FLOOR"])
+    if up and floor:
+      return CLUTCH_PEDAL_UNKNOWN
+    return CLUTCH_PEDAL_UP if up else CLUTCH_PEDAL_FLOOR if floor else CLUTCH_PEDAL_TRAVEL
 
   def get_can_parsers(self, CP, CP_SP):
     # Optional on Nidec: some platforms send GAS_PEDAL (0x13C) instead of GAS_PEDAL_2 (0x130).

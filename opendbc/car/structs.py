@@ -163,6 +163,10 @@ class CarControlSP:
     bytes = auto()
 
 
+# CarStateSP.clutchPedal values (fork-only, Task 15). 0 = unknown, so the default never reads as 'pedal up'.
+CLUTCH_PEDAL_UNKNOWN, CLUTCH_PEDAL_UP, CLUTCH_PEDAL_TRAVEL, CLUTCH_PEDAL_FLOOR = 0, 1, 2, 3
+
+
 @auto_dataclass
 class CarStateSP:
   speedLimit: float = auto_field()
@@ -171,3 +175,6 @@ class CarStateSP:
   # clutchSignalValid is False.
   gearRaw: int = auto_field()
   clutchSignalValid: bool = auto_field()
+  # fork-only (Task 15): the clutch pedal switches (Honda radarless: GAS_PEDAL_2) - 0 unknown / not alive (the default), 1 fully
+  # up, 2 in travel, 3 on the floor. Tells clutch-in from neutral-with-the-clutch-out (both decouple: clutchPressed).
+  clutchPedal: int = auto_field()

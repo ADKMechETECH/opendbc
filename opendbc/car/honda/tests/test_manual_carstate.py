@@ -2,6 +2,7 @@ import unittest
 
 from opendbc.can import CANPacker
 from opendbc.car import Bus, gen_empty_fingerprint, structs
+from opendbc.car.honda.carstate import PhantomGearGuard, PHANTOM_RPM_MAX, PHANTOM_RPM_RELEASE, PHANTOM_MAX_SPEED
 from opendbc.car.honda.hondacan import CanBus
 from opendbc.car.structs import CLUTCH_PEDAL_UNKNOWN, CLUTCH_PEDAL_UP, CLUTCH_PEDAL_TRAVEL, CLUTCH_PEDAL_FLOOR
 from opendbc.car.honda.interface import CarInterface
@@ -161,6 +162,13 @@ class TestHondaManualCarState(unittest.TestCase):
     self.assertFalse(self._step(4, rpm=2500.).deprecated.clutchPressed)
     self.assertTrue(self._step(GEAR_MT_CLUTCH, rpm=2500.).deprecated.clutchPressed)
 
+  def test_phantom_gear_at_standstill_idle(self):
+    # Stage 1: parked / stopped in neutral at idle, GEAR_MT read 1 for 19 s with the pedal up. vEgo is 0 here.
+    for _ in range(20):
+      self.assertTrue(self._step(1, rpm=830., pedal=(1, 0)).deprecated.clutchPressed)
+    # the engine driven clearly above idle at the same reported gear: trusted
+    self.assertFalse(self._step(1, rpm=PHANTOM_RPM_RELEASE + 50., pedal=(1, 0)).deprecated.clutchPressed)
+
 
 def run_bus(CP, CS, parsers, skip=(), seconds=1.0):
   """Feed every message the parsers subscribed (at 100 Hz, valid counters/checksums) except `skip`; return can_valid."""
@@ -314,6 +322,51 @@ class TestHondaManualSignalsScope(unittest.TestCase):
     ret, _ = CS.update(parsers)
     self.assertFalse(ret.deprecated.clutchPressed)
     self.assertEqual(ret.deprecated.engineRpm, 0.)
+
+
+class TestPhantomGearGuard(unittest.TestCase):
+  """Task 15: GEAR_MT is ratio-derived; in neutral at idle it reports whichever gear idle rpm matches. Cases from the
+  Stage 1 route (00000002--6c1a3bb7d4)."""
+
+  @staticmethod
+  def feed(guard, frames):
+    return [guard.update(g, rpm, v) for g, rpm, v in frames]
+
+  def test_neutral_sweep_stays_untrusted(self):
+    # t=825.7 s: 6th reported at 844 rpm / 10.9 m/s while braking in neutral; rpm stays at idle as the speed falls
+    g = PhantomGearGuard()
+    frames = [(6, 844. + (i % 3), 10.9 - 0.012 * i) for i in range(75)]
+    self.assertTrue(all(self.feed(g, frames)))
+    # then 5th as idle matches 5th's ratio (a new value is judged afresh)
+    self.assertTrue(all(self.feed(g, [(5, 849., 8.4 - 0.012 * i) for i in range(30)])))
+
+  def test_direct_sweep_two_to_one(self):
+    g = PhantomGearGuard()
+    self.assertTrue(all(self.feed(g, [(2, 840., 2.3 - 0.01 * i) for i in range(20)])))
+    self.assertTrue(all(self.feed(g, [(1, 840., 1.9 - 0.01 * i) for i in range(20)])))
+
+  def test_real_low_rpm_gear_trusted_once_rpm_follows_speed(self):
+    # t=312.1 s style: 4th at 1011 rpm / 8.6 m/s, then the car slows in gear and the rpm follows at the ratio
+    g = PhantomGearGuard()
+    r0, v0 = 1011., 8.6
+    out = self.feed(g, [(4, r0 * (v0 - 0.02 * i) / v0, v0 - 0.02 * i) for i in range(60)])
+    self.assertTrue(out[0], "untrusted when first reported")
+    self.assertFalse(out[-1], "trusted once the rpm tracked the speed")
+    self.assertLess(out.index(False), 40, "within ~0.4 s at 2 m/s^2")
+
+  def test_rpm_above_idle_trusts(self):
+    g = PhantomGearGuard()
+    self.assertTrue(g.update(2, 1000., 4.0))
+    self.assertFalse(g.update(2, PHANTOM_RPM_RELEASE, 4.0))
+
+  def test_outside_the_phantom_region_trusted_at_once(self):
+    for rpm, v in ((PHANTOM_RPM_MAX, 5.), (900., PHANTOM_MAX_SPEED), (2400., 15.)):
+      with self.subTest(rpm=rpm, v=v):
+        self.assertFalse(PhantomGearGuard().update(3, rpm, v))
+
+  def test_reverse_and_zero_never_flagged(self):
+    for gear in (0, 14):
+      self.assertFalse(PhantomGearGuard().update(gear, 800., 1.0))
 
 
 if __name__ == "__main__":

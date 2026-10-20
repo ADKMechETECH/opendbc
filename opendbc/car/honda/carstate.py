@@ -28,6 +28,42 @@ GEARBOX_ALT_2_MAX_BAD_COUNTER = 5           # own counter check (the parser's is
 GAS_PEDAL_2_TIMEOUT_NS = 250_000_000        # GAS_PEDAL_2 older than this = clutch pedal switch not alive
 
 
+# Phantom-gear guard. GEAR_MT is the PCM's gear inferred from rpm / speed: rolling in neutral (clutch out) at idle it
+# reports whichever gear's ratio idle rpm happens to match as the speed changes (Stage 1: 6th at 10.9 m/s, then 5th;
+# 3rd -> 2nd -> 1st while braking to a stop). A gear first reported at near-idle rpm is untrusted until the rpm follows
+# the speed at that ratio, or rises clearly above idle (in neutral it only can with the gas, which breaks the ratio
+# match and drops GEAR_MT to 0).
+# TODO(on-car): warm idle was 800-860 rpm on 2026-10-20; check cold idle (it must stay under PHANTOM_RPM_MAX).
+PHANTOM_RPM_MAX = 1100.        # rpm, a gear reported below this...
+PHANTOM_MAX_SPEED = 13.0       # m/s, ...and below this speed (6th at 1100 rpm = 12.9 m/s) is untrusted at first
+PHANTOM_RPM_RELEASE = 1250.    # rpm, trusted once the engine is clearly driven above idle
+PHANTOM_CONFIRM_RPM = 80.      # rpm, trusted once the speed change implies at least this rpm change at the reported
+PHANTOM_CONFIRM_TOL = 0.35     # ratio and the rpm actually moved within this fraction of it (idle noise is ~+-10 rpm)
+
+
+class PhantomGearGuard:
+  """Tracks whether the gear GEAR_MT reports can be trusted (see PHANTOM_*). update() returns True while it can't."""
+
+  def __init__(self):
+    self.gear_mt: int | None = None
+    self.untrusted = False
+    self.v0 = 0.
+    self.rpm0 = 0.
+
+  def update(self, gear_mt: int, rpm: float, v_ego: float) -> bool:
+    if gear_mt != self.gear_mt:
+      # every new value is judged afresh (a sweep can go 2 -> 1 without passing through 0)
+      self.gear_mt = gear_mt
+      self.untrusted = 1 <= gear_mt <= 6 and rpm < PHANTOM_RPM_MAX and v_ego < PHANTOM_MAX_SPEED
+      self.v0, self.rpm0 = v_ego, rpm
+    elif self.untrusted:
+      expected = (v_ego - self.v0) * self.rpm0 / max(self.v0, 0.1)   # rpm change if coupled at the reported ratio
+      tracks = abs(expected) >= PHANTOM_CONFIRM_RPM and abs(rpm - self.rpm0 - expected) < PHANTOM_CONFIRM_TOL * abs(expected)
+      if rpm >= PHANTOM_RPM_RELEASE or tracks:
+        self.untrusted = False
+    return self.untrusted
+
+
 class CarState(CarStateBase, CarStateExt):
   def __init__(self, CP, CP_SP):
     CarStateBase.__init__(self, CP, CP_SP)
@@ -43,6 +79,7 @@ class CarState(CarStateBase, CarStateExt):
     # GEARBOX_ALT_2 counter check (manual radarless): last COUNTER seen and the bad-counter score (0 = clean)
     self.gearbox_alt_2_counter: int | None = None
     self.gearbox_alt_2_counter_fail = 0
+    self.phantom_gear_guard = PhantomGearGuard()
 
     self.car_state_scm_msg = "SCM_FEEDBACK"
     if CP.flags & HondaFlags.NIDEC_ALT_SCM_MESSAGES:
@@ -266,11 +303,12 @@ class CarState(CarStateBase, CarStateExt):
         rpm = cp.vl["POWERTRAIN_DATA"]["ENGINE_RPM"]
         ret.deprecated.engineRpm = rpm
         ret_sp.clutchPedal = self.clutch_pedal(cp)
+        phantom = self.phantom_gear_guard.update(gear_mt, rpm, ret.vEgo)
         # clutchPressed = the drivetrain is decoupled: the pedal has left its top switch (the earliest cue, up to ~0.5 s
-        # before GEAR_MT drops), or GEAR_MT has no gear (clutch in OR neutral with the clutch out).
+        # before GEAR_MT drops), or GEAR_MT has no gear (clutch in OR neutral with the clutch out), or a phantom gear.
         # CarStateSP.clutchPedal tells clutch-in from neutral. Without a live pedal switch: GEAR_MT alone, as before.
         pedal_pressed = ret_sp.clutchPedal in (CLUTCH_PEDAL_TRAVEL, CLUTCH_PEDAL_FLOOR)
-        ret.deprecated.clutchPressed = pedal_pressed or gear_mt not in GEAR_MT_COUPLED
+        ret.deprecated.clutchPressed = pedal_pressed or gear_mt not in GEAR_MT_COUPLED or phantom
     else:
       gear_position = self.shifter_values.get(cp.vl[self.gearbox_msg]["GEAR_SHIFTER"], None)
       ret.gearShifter = self.parse_gear_shifter(gear_position)

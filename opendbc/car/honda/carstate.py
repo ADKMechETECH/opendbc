@@ -260,12 +260,10 @@ class CarState(CarStateBase, CarStateExt):
                                    (rejected == 0 or (cp.last_nonempty_nanos - rejected) >= GEARBOX_ALT_2_REJECT_HOLD_NS)
         ret_sp.gearRaw = gear_mt if ret_sp.clutchSignalValid else -1
         ret.deprecated.clutchPressed = gear_mt not in GEAR_MT_COUPLED
-        # TODO(on-car): verify ENGINE_RPM needs no extra scaling (DBC: scale 1, offset 0, rpm) against the tach in cabana.
-        # The Integra has no ENGINE_DATA (see the speed blend above); POWERTRAIN_DATA carries ENGINE_RPM too.
-        if self.CP.carFingerprint == CAR.ACURA_INTEGRA:
-          ret.deprecated.engineRpm = cp.vl["POWERTRAIN_DATA"]["ENGINE_RPM"]
-        else:
-          ret.deprecated.engineRpm = cp.vl["ENGINE_DATA"]["ENGINE_RPM"]
+        # RPM from POWERTRAIN_DATA: ENGINE_DATA's ENGINE_RPM reads 0 on the 2024 Civic 6MT (Stage 1, 2026-10-20), and the
+        # Integra has no ENGINE_DATA at all. POWERTRAIN_DATA's matched speed x gear ratio within 0.4 % in every gear.
+        rpm = cp.vl["POWERTRAIN_DATA"]["ENGINE_RPM"]
+        ret.deprecated.engineRpm = rpm
     else:
       gear_position = self.shifter_values.get(cp.vl[self.gearbox_msg]["GEAR_SHIFTER"], None)
       ret.gearShifter = self.parse_gear_shifter(gear_position)

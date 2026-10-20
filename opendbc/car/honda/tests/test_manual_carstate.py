@@ -32,10 +32,11 @@ class TestHondaManualCarState(unittest.TestCase):
     # CANParser.vl subscribes messages lazily on first read, so run one update before feeding frames
     self.CS.update(self.parsers)
 
-  def _step(self, gear_mt, rpm=0., reverse_light=False):
+  def _step(self, gear_mt, rpm=0., reverse_light=False, engine_data_rpm=0.):
     msgs = [
       self.packer.make_can_msg("GEARBOX_ALT_2", self.bus, {"GEAR_MT": gear_mt}),
-      self.packer.make_can_msg("ENGINE_DATA", self.bus, {"ENGINE_RPM": rpm}),
+      self.packer.make_can_msg("POWERTRAIN_DATA", self.bus, {"ENGINE_RPM": rpm}),
+      self.packer.make_can_msg("ENGINE_DATA", self.bus, {"ENGINE_RPM": engine_data_rpm}),
       self.packer.make_can_msg("SCM_FEEDBACK", self.bus, {"REVERSE_LIGHT": int(reverse_light)}),
     ]
     self.t += int(0.01 * 1e9)
@@ -78,7 +79,7 @@ class TestHondaManualCarState(unittest.TestCase):
 
   def _step_sp(self, gear_mt=None, rpm=0.):
     """Like _step, but GEARBOX_ALT_2 is optional (None = not on the bus this frame); returns (ret, ret_sp)."""
-    msgs = [self.packer.make_can_msg("ENGINE_DATA", self.bus, {"ENGINE_RPM": rpm}),
+    msgs = [self.packer.make_can_msg("POWERTRAIN_DATA", self.bus, {"ENGINE_RPM": rpm}),
             self.packer.make_can_msg("SCM_FEEDBACK", self.bus, {"REVERSE_LIGHT": 0})]
     if gear_mt is not None:
       msgs.append(self.packer.make_can_msg("GEARBOX_ALT_2", self.bus, {"GEAR_MT": gear_mt}))
@@ -109,6 +110,12 @@ class TestHondaManualCarState(unittest.TestCase):
     for gear_mt, pressed in ((7, True), (13, True), (15, True), (0, True), (6, False), (14, False)):
       with self.subTest(gear_mt=gear_mt):
         self.assertEqual(self._step(gear_mt, rpm=2000.).deprecated.clutchPressed, pressed)
+
+  def test_rpm_from_powertrain_data_not_engine_data(self):
+    # Task 15 / Stage 1 (2026-10-20): ENGINE_DATA's ENGINE_RPM reads 0 on the car; POWERTRAIN_DATA carries the real rpm
+    self.assertAlmostEqual(self._step(3, rpm=2100., engine_data_rpm=0.).deprecated.engineRpm, 2100.)
+    self.assertAlmostEqual(self._step(3, rpm=2100., engine_data_rpm=4000.).deprecated.engineRpm, 2100.,
+                           msg="ENGINE_DATA must not be read")
 
 
 def run_bus(CP, CS, parsers, skip=(), seconds=1.0):

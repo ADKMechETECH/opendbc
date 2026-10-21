@@ -178,3 +178,7 @@ class CarStateSP:
   # fork-only (Task 15): the clutch pedal switches (Honda radarless: GAS_PEDAL_2) - 0 unknown / not alive (the default), 1 fully
   # up, 2 in travel, 3 on the floor. Tells clutch-in from neutral-with-the-clutch-out (both decouple: clutchPressed).
   clutchPedal: int = auto_field()
+  # fork-only (Task 17): the engine's own torque estimate at the wheels (Honda radarless: GAS_PEDAL_2.ENGINE_TORQUE_ESTIMATE),
+  # N*m, negative = engine braking; NaN while not alive. Engine side only (never includes the service brakes): the
+  # engine-brake learner's brake-free measurement.
+  engineTorqueAxle: float = auto_field()

@@ -1,3 +1,4 @@
+import math
 import unittest
 
 from opendbc.can import CANPacker
@@ -37,7 +38,7 @@ class TestHondaManualCarState(unittest.TestCase):
   def _step(self, gear_mt, rpm=0., reverse_light=False, pedal=None):
     return self._step_full(gear_mt, rpm, reverse_light, pedal)[0]
 
-  def _step_full(self, gear_mt, rpm=0., reverse_light=False, pedal=None, engine_data_rpm=0.):
+  def _step_full(self, gear_mt, rpm=0., reverse_light=False, pedal=None, engine_data_rpm=0., torque=0.):
     """pedal = (CLUTCH_PEDAL_UP, CLUTCH_PEDAL_FLOOR) switch bits in GAS_PEDAL_2, or None = GAS_PEDAL_2 not sent."""
     msgs = [
       self.packer.make_can_msg("GEARBOX_ALT_2", self.bus, {"GEAR_MT": gear_mt}),
@@ -46,7 +47,8 @@ class TestHondaManualCarState(unittest.TestCase):
       self.packer.make_can_msg("SCM_FEEDBACK", self.bus, {"REVERSE_LIGHT": int(reverse_light)}),
     ]
     if pedal is not None:
-      msgs.append(self.packer.make_can_msg("GAS_PEDAL_2", self.bus, {"CLUTCH_PEDAL_UP": pedal[0], "CLUTCH_PEDAL_FLOOR": pedal[1]}))
+      msgs.append(self.packer.make_can_msg("GAS_PEDAL_2", self.bus, {"CLUTCH_PEDAL_UP": pedal[0], "CLUTCH_PEDAL_FLOOR": pedal[1],
+                                                                        "ENGINE_TORQUE_ESTIMATE": torque}))
     self.t += int(0.01 * 1e9)
     self.parsers[Bus.pt].update([self.t, msgs])
     return self.CS.update(self.parsers)
@@ -142,6 +144,16 @@ class TestHondaManualCarState(unittest.TestCase):
     for _ in range(30):   # 0.3 s without GAS_PEDAL_2 while the bus keeps going
       _, sp = self._step_full(4, rpm=2500.)
     self.assertEqual(sp.clutchPedal, CLUTCH_PEDAL_UNKNOWN, "stale")
+
+  def test_engine_torque_axle(self):
+    # Task 17: the engine's own axle-torque figure, NaN until / unless GAS_PEDAL_2 is alive
+    _, sp = self._step_full(4, rpm=2500.)
+    self.assertTrue(math.isnan(sp.engineTorqueAxle), "never received")
+    _, sp = self._step_full(4, rpm=2500., pedal=(1, 0), torque=-82.)
+    self.assertAlmostEqual(sp.engineTorqueAxle, -82.)
+    for _ in range(30):
+      _, sp = self._step_full(4, rpm=2500.)
+    self.assertTrue(math.isnan(sp.engineTorqueAxle), "stale")
 
   def test_pedal_switch_leads_gear_mt(self):
     # the pedal leaving its top switch decouples at once, while GEAR_MT still reports the gear

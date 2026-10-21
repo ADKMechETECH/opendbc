@@ -303,6 +303,7 @@ class CarState(CarStateBase, CarStateExt):
         rpm = cp.vl["POWERTRAIN_DATA"]["ENGINE_RPM"]
         ret.deprecated.engineRpm = rpm
         ret_sp.clutchPedal = self.clutch_pedal(cp)
+        ret_sp.engineTorqueAxle = self.engine_torque_axle(cp)
         phantom = self.phantom_gear_guard.update(gear_mt, rpm, ret.vEgo)
         # clutchPressed = the drivetrain is decoupled: the pedal has left its top switch (the earliest cue, up to ~0.5 s
         # before GEAR_MT drops), or GEAR_MT has no gear (clutch in OR neutral with the clutch out), or a phantom gear.
@@ -487,14 +488,25 @@ class CarState(CarStateBase, CarStateExt):
     return ret, ret_sp
 
   @staticmethod
+  def gas_pedal_2_alive(cp) -> bool:
+    ts = cp.ts_nanos["GAS_PEDAL_2"]["CLUTCH_PEDAL_UP"]
+    return ts > 0 and (cp.last_nonempty_nanos - ts) < GAS_PEDAL_2_TIMEOUT_NS
+
+  @staticmethod
+  def engine_torque_axle(cp) -> float:
+    """Manual radarless (Task 17): GAS_PEDAL_2.ENGINE_TORQUE_ESTIMATE, which reads as axle torque on the 2024 Civic 6MT
+    (Stage 1: closed throttle -227 / -136 / -99 / -82 / -65 N*m in 2nd..6th = a constant crank drag x the gearing). It
+    is the engine's own figure, so it never includes the service brakes. NaN while GAS_PEDAL_2 isn't alive."""
+    return float(cp.vl["GAS_PEDAL_2"]["ENGINE_TORQUE_ESTIMATE"]) if CarState.gas_pedal_2_alive(cp) else math.nan
+
+  @staticmethod
   def clutch_pedal(cp) -> int:
     """Manual radarless: the clutch pedal switches in GAS_PEDAL_2 byte 6 (CLUTCH_PEDAL_UP = fully released, drops as
     soon as the pedal moves; CLUTCH_PEDAL_FLOOR = fully down). GAS_PEDAL_2 is registered with NaN frequency, so a
     missing / stale message reads CLUTCH_PEDAL_UNKNOWN instead of touching canValid; both switches on is not a pedal
     position, so it reads unknown too.
     TODO(on-car): seen on one car / one drive (Stage 1, 2026-10-20) - confirm in cabana with the pedal moved slowly."""
-    ts = cp.ts_nanos["GAS_PEDAL_2"]["CLUTCH_PEDAL_UP"]
-    if ts <= 0 or (cp.last_nonempty_nanos - ts) >= GAS_PEDAL_2_TIMEOUT_NS:
+    if not CarState.gas_pedal_2_alive(cp):
       return CLUTCH_PEDAL_UNKNOWN
     up, floor = bool(cp.vl["GAS_PEDAL_2"]["CLUTCH_PEDAL_UP"]), bool(cp.vl["GAS_PEDAL_2"]["CLUTCH_PEDAL_FLOOR"])
     if up and floor:

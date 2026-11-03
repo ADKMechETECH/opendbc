@@ -224,19 +224,25 @@ def band_weights(bands, v_ego):
 
 
 class HondaParamWriter:
-  # Each Params.put is write + fsync + rename + fsync(dir); the dir fsync forces an ext4 journal
-  # commit that first flushes every dirty page in the filesystem (loggerd's buffered video). The
-  # band learners grew the per-minute flush to ~33 keys, and firing those back-to-back is ~66
-  # fsyncs in one burst that other synchronous params users (hardwared, mapd) then wait behind.
-  # Writes are paced one key per PARAM_WRITE_SPACING and unchanged values are skipped.
-  PARAM_WRITE_SPACING = 1.0  # s
-
+  # Each Params.put is write + fsync + rename + fsync(dir); the dir fsync forces an ext4 journal commit
+  # that first flushes every dirty page in the filesystem (loggerd's buffered video). On this device that
+  # stalls the synchronous params users (hardwared, manager, mapd) and the car process for hundreds of ms.
+  # The earlier design paced the writes one key per second, but that put a journal flush on the live
+  # driving path for the whole drive (the learners submit ~21-33 changed keys per minute), which selfdrived
+  # reports as commIssue / "System Lagging" and which blocks engagement. So persist ONLY when parked and
+  # disengaged (set_safe), where a stall is harmless, and flush the whole pending batch at once there. The
+  # learned tables are slowly varying, so checkpointing at stops / drive-end loses nothing that matters.
   def __init__(self):
     self._params = Params()
     self._queue = Queue()
     self._written: dict[str, float] = {}
+    self._safe = False   # only persist when parked + disengaged (set_safe); never on the live driving path
     self._thread = threading.Thread(target=self._run, name="honda-param-writer", daemon=True)
     self._thread.start()
+
+  def set_safe(self, safe: bool) -> None:
+    # Called every control frame. A plain bool store is atomic in CPython, so no lock is needed.
+    self._safe = bool(safe)
 
   def put_many(self, values):
     self._queue.put({key: float(value) for key, value in values.items()})
@@ -255,17 +261,32 @@ class HondaParamWriter:
     pending: dict[str, float] = {}
     while True:
       self._drain(pending, block=not pending)
-
-      key, value = next(iter(pending.items()))
-      del pending[key]
-      if self._written.get(key) == value:
+      if not pending:
         continue
 
-      # block=True keeps the pacing on the disk op itself rather than on a handoff to the
-      # C++ async queue, which would re-create the burst
-      self._params.put(key, value, block=True)
-      self._written[key] = value
-      time.sleep(self.PARAM_WRITE_SPACING)
+      # Durable Params.put is write + fsync + rename + fsync(dir); the dir fsync forces an ext4 journal
+      # commit that first flushes every dirty page in the filesystem (loggerd's buffered video). Issued on
+      # the live driving path - as the old one-key-per-second pacing did for the whole drive - it stalls the
+      # synchronous params users (hardwared -> deviceState, manager -> managerState) and this car process
+      # for hundreds of ms each, which selfdrived reports as commIssue / "System Lagging" and which blocks
+      # engagement (route 00000048: card carState gaps up to ~8 s, cruise unusable). So persist ONLY when the
+      # car is parked and disengaged, where a stall is harmless. The learned tables are slowly varying, so
+      # checkpointing at stops / drive-end loses nothing that matters; flush the whole pending batch at once
+      # there (no per-key pacing needed off the driving path).
+      if not self._safe:
+        time.sleep(0.2)
+        continue
+
+      for key in list(pending):
+        value = pending.pop(key)
+        if self._written.get(key) == value:
+          continue
+        # a key not registered in this openpilot build must not take the writer thread down with it
+        try:
+          self._params.put(key, value, block=True)
+          self._written[key] = value
+        except Exception:
+          pass
 
 class CarController(CarControllerBase, MadsCarController, GasInterceptorCarController, IntelligentCruiseButtonManagementInterface,
                     EpsModCarController):
@@ -480,6 +501,10 @@ class CarController(CarControllerBase, MadsCarController, GasInterceptorCarContr
     MadsCarController.update(self, self.CP, CC, CC_SP)
     gas_pedal_force = 0.0
     actuators = CC.actuators
+    # Only let the learned-param writer touch the disk when parked and disengaged: durable param writes
+    # force a full-filesystem ext4 journal flush that stalls hardwared/manager/card -> commIssue (see
+    # HondaParamWriter). Checkpoint the slowly-varying learned tables at stops / drive-end instead.
+    self.param_writer.set_safe(CS.out.vEgo < 0.3 and not CC.enabled)
     hud_control = CC.hudControl
     if self.CP.flags & HondaFlags.BOSCH:
       hud_v_cruise = hud_control.setSpeed / CS.v_cruise_factor if 0 < CS.out.vCruise < 255 else 255

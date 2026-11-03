@@ -4,6 +4,7 @@ from collections import defaultdict
 
 from opendbc.can import CANDefine, CANParser
 from opendbc.car import Bus, create_button_events, structs, DT_CTRL
+from opendbc.car.structs import CLUTCH_PEDAL_UNKNOWN, CLUTCH_PEDAL_UP, CLUTCH_PEDAL_TRAVEL, CLUTCH_PEDAL_FLOOR
 from opendbc.car.common.conversions import Conversions as CV
 from opendbc.car.honda.hondacan import CanBus
 from opendbc.car.honda.values import CAR, DBC, STEER_THRESHOLD, HondaFlags, CruiseButtons, CruiseSettings, \
@@ -20,6 +21,48 @@ BUTTONS_DICT = {CruiseButtons.RES_ACCEL: ButtonType.accelCruise, CruiseButtons.D
                 CruiseButtons.MAIN: ButtonType.mainCruise, CruiseButtons.CANCEL: ButtonType.cancel}
 SETTINGS_BUTTONS_DICT = {CruiseSettings.DISTANCE: ButtonType.gapAdjustCruise, CruiseSettings.LKAS: ButtonType.lkas}
 
+# fork-only (civic-cruise): manual gearbox / clutch plumbing, Honda Bosch-radarless only.
+GEAR_MT_COUPLED = (1, 2, 3, 4, 5, 6, 14)   # GEARBOX_ALT_2.GEAR_MT values with a gear meshed (14 = reverse)
+GEARBOX_ALT_2_ADDR = 0x1DD
+GEARBOX_ALT_2_TIMEOUT_NS = 250_000_000     # GEARBOX_ALT_2 older than this (vs the bus) = clutch signal not alive
+GEARBOX_ALT_2_MAX_BAD_COUNTER = 5          # own counter check (the parser's is off for 0x1DD, see get_can_parsers)
+GAS_PEDAL_2_TIMEOUT_NS = 250_000_000       # GAS_PEDAL_2 older than this = clutch pedal switch not alive
+
+# Phantom-gear guard. GEAR_MT is the PCM's gear inferred from rpm / speed: rolling in neutral (clutch out) at idle it
+# reports whichever gear's ratio idle rpm happens to match as the speed changes (Stage 1: 6th at 10.9 m/s, then 5th;
+# 3rd -> 2nd -> 1st while braking to a stop). A gear first reported at near-idle rpm is untrusted until the rpm follows
+# the speed at that ratio, or rises clearly above idle (in neutral it only can with the gas, which breaks the ratio
+# match and drops GEAR_MT to 0).
+# TODO(on-car): warm idle was 800-860 rpm on 2026-10-20; check cold idle (it must stay under PHANTOM_RPM_MAX).
+PHANTOM_RPM_MAX = 1100.        # rpm, a gear reported below this...
+PHANTOM_MAX_SPEED = 13.0       # m/s, ...and below this speed (6th at 1100 rpm = 12.9 m/s) is untrusted at first
+PHANTOM_RPM_RELEASE = 1250.    # rpm, trusted once the engine is clearly driven above idle
+PHANTOM_CONFIRM_RPM = 80.      # rpm, trusted once the speed change implies at least this rpm change at the reported
+PHANTOM_CONFIRM_TOL = 0.35     # ratio and the rpm actually moved within this fraction of it (idle noise is ~+-10 rpm)
+
+
+class PhantomGearGuard:
+  """Tracks whether the gear GEAR_MT reports can be trusted (see PHANTOM_*). update() returns True while it can't."""
+
+  def __init__(self):
+    self.gear_mt: int | None = None
+    self.untrusted = False
+    self.v0 = 0.
+    self.rpm0 = 0.
+
+  def update(self, gear_mt: int, rpm: float, v_ego: float) -> bool:
+    if gear_mt != self.gear_mt:
+      # every new value is judged afresh (a sweep can go 2 -> 1 without passing through 0)
+      self.gear_mt = gear_mt
+      self.untrusted = 1 <= gear_mt <= 6 and rpm < PHANTOM_RPM_MAX and v_ego < PHANTOM_MAX_SPEED
+      self.v0, self.rpm0 = v_ego, rpm
+    elif self.untrusted:
+      expected = (v_ego - self.v0) * self.rpm0 / max(self.v0, 0.1)   # rpm change if coupled at the reported ratio
+      tracks = abs(expected) >= PHANTOM_CONFIRM_RPM and abs(rpm - self.rpm0 - expected) < PHANTOM_CONFIRM_TOL * abs(expected)
+      if rpm >= PHANTOM_RPM_RELEASE or tracks:
+        self.untrusted = False
+    return self.untrusted
+
 
 class CarState(CarStateBase, CarStateExt):
   def __init__(self, CP, CP_SP):
@@ -32,6 +75,12 @@ class CarState(CarStateBase, CarStateExt):
       if CP.transmissionType == TransmissionType.cvt:
         self.gearbox_msg = "GEARBOX_CVT"
       self.shifter_values = can_define.dv[self.gearbox_msg]["GEAR_SHIFTER"]
+
+    # fork-only (civic-cruise): GEARBOX_ALT_2 counter check (manual radarless): last COUNTER seen and the bad-counter
+    # score (0 = clean), plus the phantom-gear guard.
+    self.gearbox_alt_2_counter: int | None = None
+    self.gearbox_alt_2_counter_fail = 0
+    self.phantom_gear_guard = PhantomGearGuard()
 
     self.car_state_scm_msg = "SCM_FEEDBACK"
     if CP.flags & HondaFlags.NIDEC_ALT_SCM_MESSAGES:
@@ -223,6 +272,44 @@ class CarState(CarStateBase, CarStateExt):
 
     if self.CP.transmissionType == TransmissionType.manual:
       ret.gearShifter = GearShifter.reverse if bool(cp.vl[self.car_state_scm_msg]["REVERSE_LIGHT"]) else GearShifter.drive
+
+      # fork-only (civic-cruise): manual gear/clutch plumbing. GEARBOX_ALT_2 only exists in the radarless DBC.
+      # clutchPressed/engineRpm are pre-existing slots in CarState's deprecated group, reused so no cereal schema
+      # change is needed; the raw gear and the message's liveness go in CarStateSP (fork-only fields).
+      if self.CP.flags & HondaFlags.BOSCH_RADARLESS:
+        # GEAR_MT is the PCM's inferred gear (0=Clutch/no gear meshed, 1-6=gear, 14=reverse), not a raw clutch switch.
+        # Any other value (undocumented 7, 13, 15, ...) counts as decoupled. GEARBOX_ALT_2 is registered with NaN
+        # frequency (get_can_parsers), so its absence never touches canValid; clutchSignalValid says whether it is alive
+        # (a missing message reads as GEAR_MT 0, so the clutch features stay inert without it).
+        # TODO(on-car): verify GEAR_MT values and timing vs. real clutch travel (and true neutral at a stop) in cabana.
+        gear_mt = int(cp.vl["GEARBOX_ALT_2"]["GEAR_MT"])
+        ts = cp.ts_nanos["GEARBOX_ALT_2"]["GEAR_MT"]
+        # alive = fresh AND a clean counter. The parser's own counter check is off for 0x1DD (get_can_parsers) so a bad
+        # counter can never invalidate CAN for the whole car; we score it here and report it through clutchSignalValid.
+        # TODO(port): the old fork also rejected frames with a bad checksum via the parser's last_rejected_nanos, which
+        # this opendbc (sp-steer base) lacks; checksum faults were 0 on-car (Stage 1), so dropped until the parser gains it.
+        for counter in cp.vl_all["GEARBOX_ALT_2"]["COUNTER"]:
+          counter = int(counter)
+          if self.gearbox_alt_2_counter is not None and counter != (self.gearbox_alt_2_counter + 1) % 4:
+            self.gearbox_alt_2_counter_fail = min(self.gearbox_alt_2_counter_fail + 1, GEARBOX_ALT_2_MAX_BAD_COUNTER)
+          elif self.gearbox_alt_2_counter_fail > 0:
+            self.gearbox_alt_2_counter_fail -= 1
+          self.gearbox_alt_2_counter = counter
+        ret_sp.clutchSignalValid = ts > 0 and (cp.last_nonempty_nanos - ts) < GEARBOX_ALT_2_TIMEOUT_NS and \
+                                   self.gearbox_alt_2_counter_fail == 0
+        ret_sp.gearRaw = gear_mt if ret_sp.clutchSignalValid else -1
+        # RPM from POWERTRAIN_DATA: ENGINE_DATA's ENGINE_RPM reads 0 on the 2024 Civic 6MT (Stage 1, 2026-10-20), and the
+        # Integra has no ENGINE_DATA at all. POWERTRAIN_DATA's matched speed x gear ratio within 0.4 % in every gear.
+        rpm = cp.vl["POWERTRAIN_DATA"]["ENGINE_RPM"]
+        ret.deprecated.engineRpm = rpm
+        ret_sp.clutchPedal = self.clutch_pedal(cp)
+        ret_sp.engineTorqueAxle = self.engine_torque_axle(cp)
+        phantom = self.phantom_gear_guard.update(gear_mt, rpm, ret.vEgo)
+        # clutchPressed = the drivetrain is decoupled: the pedal has left its top switch (the earliest cue, up to ~0.5 s
+        # before GEAR_MT drops), or GEAR_MT has no gear (clutch in OR neutral with the clutch out), or a phantom gear.
+        # CarStateSP.clutchPedal tells clutch-in from neutral. Without a live pedal switch: GEAR_MT alone, as before.
+        pedal_pressed = ret_sp.clutchPedal in (CLUTCH_PEDAL_TRAVEL, CLUTCH_PEDAL_FLOOR)
+        ret.deprecated.clutchPressed = pedal_pressed or gear_mt not in GEAR_MT_COUPLED or phantom
     else:
       gear_position = self.shifter_values.get(cp.vl[self.gearbox_msg]["GEAR_SHIFTER"], None)
       ret.gearShifter = self.parse_gear_shifter(gear_position)
@@ -400,6 +487,33 @@ class CarState(CarStateBase, CarStateExt):
 
     return ret, ret_sp
 
+  # fork-only (civic-cruise): manual radarless clutch/engine-torque helpers.
+  @staticmethod
+  def gas_pedal_2_alive(cp) -> bool:
+    ts = cp.ts_nanos["GAS_PEDAL_2"]["CLUTCH_PEDAL_UP"]
+    return ts > 0 and (cp.last_nonempty_nanos - ts) < GAS_PEDAL_2_TIMEOUT_NS
+
+  @staticmethod
+  def engine_torque_axle(cp) -> float:
+    """Manual radarless: GAS_PEDAL_2.ENGINE_TORQUE_ESTIMATE, which reads as axle torque on the 2024 Civic 6MT (Stage 1:
+    closed throttle -227 / -136 / -99 / -82 / -65 N*m in 2nd..6th = a constant crank drag x the gearing). It is the
+    engine's own figure, so it never includes the service brakes. NaN while GAS_PEDAL_2 isn't alive."""
+    return float(cp.vl["GAS_PEDAL_2"]["ENGINE_TORQUE_ESTIMATE"]) if CarState.gas_pedal_2_alive(cp) else math.nan
+
+  @staticmethod
+  def clutch_pedal(cp) -> int:
+    """Manual radarless: the clutch pedal switches in GAS_PEDAL_2 byte 6 (CLUTCH_PEDAL_UP = fully released, drops as
+    soon as the pedal moves; CLUTCH_PEDAL_FLOOR = fully down). GAS_PEDAL_2 is registered with NaN frequency, so a
+    missing / stale message reads CLUTCH_PEDAL_UNKNOWN instead of touching canValid; both switches on is not a pedal
+    position, so it reads unknown too.
+    TODO(on-car): seen on one car / one drive (Stage 1, 2026-10-20) - confirm in cabana with the pedal moved slowly."""
+    if not CarState.gas_pedal_2_alive(cp):
+      return CLUTCH_PEDAL_UNKNOWN
+    up, floor = bool(cp.vl["GAS_PEDAL_2"]["CLUTCH_PEDAL_UP"]), bool(cp.vl["GAS_PEDAL_2"]["CLUTCH_PEDAL_FLOOR"])
+    if up and floor:
+      return CLUTCH_PEDAL_UNKNOWN
+    return CLUTCH_PEDAL_UP if up else CLUTCH_PEDAL_FLOOR if floor else CLUTCH_PEDAL_TRAVEL
+
   def get_can_parsers(self, CP, CP_SP):
     # Optional on Nidec: some platforms send GAS_PEDAL (0x13C) instead of GAS_PEDAL_2 (0x130).
     # Register before lazy vl access so missing messages do not count against canValid.
@@ -417,10 +531,17 @@ class CarState(CarStateBase, CarStateExt):
       # HUD_OBJECTS is polled by the HudObjectTracker, but not every radarless camera emits it,
       # so subscribe with NaN frequency to skip the alive/timeout checks.
       cam_messages += [("HUD_OBJECTS", float('nan'))]
+      if CP.transmissionType == TransmissionType.manual:
+        # fork-only (civic-cruise): manual gear/clutch. Its absence must never invalidate CAN (CarStateSP.clutchSignalValid).
+        pt_messages += [("GEARBOX_ALT_2", float('nan'))]
     parsers = {
       Bus.pt: CANParser(DBC[CP.carFingerprint][Bus.pt], pt_messages, CanBus(CP).pt),
       Bus.cam: CANParser(DBC[CP.carFingerprint][Bus.pt], cam_messages, CanBus(CP).camera),
     }
+    if self.CP.flags & HondaFlags.BOSCH_RADARLESS and CP.transmissionType == TransmissionType.manual:
+      # fork-only (civic-cruise): the parser's own counter failures invalidate CAN even at NaN frequency; update()
+      # checks GEARBOX_ALT_2's counter itself and reports it through clutchSignalValid.
+      parsers[Bus.pt].message_states[GEARBOX_ALT_2_ADDR].ignore_counter = True
     if CP.flags & HondaFlags.HAS_BSM:
       parsers[Bus.body] = CANParser(DBC[CP.carFingerprint][Bus.body], [], CanBus(CP).radar)
     if self.CP.flags & HondaFlags.BOSCH_CANFD:

@@ -163,6 +163,21 @@ class CarControlSP:
     bytes = auto()
 
 
+# fork-only (civic-cruise): clutch pedal switch positions (see CarStateSP.clutchPedal)
+CLUTCH_PEDAL_UNKNOWN, CLUTCH_PEDAL_UP, CLUTCH_PEDAL_TRAVEL, CLUTCH_PEDAL_FLOOR = 0, 1, 2, 3
+
+
 @auto_dataclass
 class CarStateSP:
   speedLimit: float = auto_field()
+  # fork-only (civic-cruise): the manual gearbox's own gear signal (Honda radarless: GEARBOX_ALT_2.GEAR_MT) and whether
+  # that message is alive. A missing message would read as GEAR_MT 0 (= clutch pressed), so consumers stay inert while
+  # clutchSignalValid is False.
+  gearRaw: int = auto_field()
+  clutchSignalValid: bool = auto_field()
+  # fork-only: the clutch pedal switches (Honda radarless: GAS_PEDAL_2) - 0 unknown / not alive (the default), 1 fully
+  # up, 2 in travel, 3 on the floor. Tells clutch-in from neutral-with-the-clutch-out (both decouple: clutchPressed).
+  clutchPedal: int = auto_field()
+  # fork-only: the engine's own torque estimate at the wheels (Honda radarless: GAS_PEDAL_2.ENGINE_TORQUE_ESTIMATE),
+  # N*m, negative = engine braking; NaN while not alive. Engine side only (never includes the service brakes).
+  engineTorqueAxle: float = auto_field()

@@ -42,8 +42,34 @@ BO_ 526 ABS_SENSOR: 8 XXX
  SG_ CHECKSUM : 59|4@0+ (1,0) [0|15] "" XXX
  SG_ COUNTER : 61|2@0+ (1,0) [0|3] "" XXX
 
+BO_ 2045 EPS_TELEMETRY_DELIVERED: 8 EPS
+ SG_ CMD_Q : 0|16@1- (1,0) [-11084|11084] "" XXX
+ SG_ D322 : 16|16@1- (1,0) [-32768|32767] "" XXX
+ SG_ AUTH_SCALE : 32|16@1+ (1,0) [0|65535] "" XXX
+ SG_ SEL : 48|1@1+ (1,0) [0|1] "" XXX
+ SG_ CAP_HIT : 49|1@1+ (1,0) [0|1] "" XXX
+ SG_ COUNTER : 56|8@1+ (1,0) [0|255] "" XXX
+
+BO_ 2047 EPS_TELEMETRY_PREGAIN: 8 EPS
+ SG_ TERM1 : 0|16@1- (1,0) [-32768|32767] "" XXX
+ SG_ TERM2 : 16|16@1- (1,0) [-32768|32767] "" XXX
+ SG_ UNK1 : 32|16@1- (1,0) [-32768|32767] "" XXX
+ SG_ UNK2 : 48|16@1- (1,0) [-32768|32767] "" XXX
+
 CM_ SG_ 456 IDLESTOP_ALLOW "allows car to turn off engine at a standstill";
 CM_ SG_ 456 STANDSTILL "set to 1 when camera requests -4.0 m/s^2";
 CM_ SG_ 495 SPEED_LIMIT "Defaults to 0xFF if no speed limit found";
+CM_ BO_ 2045 "fork-only (civic-cruise): EPS tuner-firmware telemetry, NOT stock. Delivered side + regime of the steer authority chain, ~100 Hz, little-endian raw int16 firmware counts (no unit scaling). Transmitted by the modified Honda T43 EPS on the PT bus (bus 0) only once the telemetry cave is flashed; absent on stock EPS. Decode-only (cabana/rlog): carstate does not subscribe, so a missing frame never invalidates CAN";
+CM_ SG_ 2045 CMD_Q "delivered steer command; firmware hard cap +/-0x2B4C (+/-11084)";
+CM_ SG_ 2045 D322 "gain-stage carrier (~0.4766 * iVar11 at the tune)";
+CM_ SG_ 2045 AUTH_SCALE "authority scale, Q14: unity = 0x4000 (16384)";
+CM_ SG_ 2045 SEL "flags bit0";
+CM_ SG_ 2045 CAP_HIT "flags bit1: |D322| >= 0x2B4C";
+CM_ SG_ 2045 COUNTER "8-bit rolling counter, for drop detection";
+CM_ BO_ 2047 "fork-only (civic-cruise): EPS tuner-firmware telemetry, NOT stock. Pre-gain assist terms, ~100 Hz, little-endian raw int16 firmware counts (no unit scaling). Transmitted by the modified Honda T43 EPS on the PT bus (bus 0) only once the telemetry cave is flashed; absent on stock EPS. Decode-only (cabana/rlog): carstate does not subscribe";
+CM_ SG_ 2047 TERM1 "in-band assist term";
+CM_ SG_ 2047 TERM2 "variant-4 internal product";
+CM_ SG_ 2047 UNK1 "to be identified on-car";
+CM_ SG_ 2047 UNK2 "to be identified on-car";
 
 VAL_ 477 GEAR_MT 14 "reverse" 6 "6th" 5 "5th" 4 "4th" 3 "3rd" 2 "2nd" 1 "1st" 0 "Clutch";

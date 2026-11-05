@@ -287,9 +287,45 @@ class HondaParamWriter:
           pass
 
 
+class NonAccClusterLabel:
+  """fork-only (civic-cruise): mirror the car's conventional-cruise mode onto the gauge cluster.
+
+  On a radarless Bosch manual with openpilot longitudinal, the fork's non-ACC ("set-speed only") mode follows the car's
+  own ACC <-> Cruise switch (a ~1.2 s distance-button hold, kept by the stock camera and read as
+  cruiseState.nonAdaptive). The cluster icon is drawn from the ACC_HUD openpilot sends, so it only changes if openpilot
+  sets CRUISE_CONTROL_LABEL. Default ON (owner decision 2026-11-05; param NonAccClusterLabel, re-read at 1 Hz): the label
+  is the one new thing the car sees, so it stays switchable without a redeploy. Inert on every other car."""
+  PARAM = "NonAccClusterLabel"
+  DEFAULT = True
+  READ_PERIOD = 10   # calls; update() runs with the 10 Hz ACC_HUD -> 1 Hz
+
+  def __init__(self, CP, params=None):
+    self.available = bool(CP.openpilotLongitudinalControl and (CP.flags & HondaFlags.BOSCH_RADARLESS)
+                          and CP.transmissionType == structs.CarParams.TransmissionType.manual)
+    self._params = params
+    self.enabled = False   # until the first read
+    self._calls = 0
+
+  def update(self, car_non_adaptive: bool) -> bool:
+    if not self.available:
+      return False
+    if self._calls % self.READ_PERIOD == 0:
+      try:
+        if self._params is None:
+          self._params = Params()
+        # get() with the registered default, not get_bool(): get_bool reads an unset key as False
+        v = self._params.get(self.PARAM, return_default=True)
+        self.enabled = self.DEFAULT if v is None else bool(v)
+      except Exception:
+        self.enabled = False   # unknown key / no params: never show the label
+    self._calls += 1
+    return bool(self.enabled and car_non_adaptive)
+
+
 class CarController(CarControllerBase, MadsCarController, GasInterceptorCarController, IntelligentCruiseButtonManagementInterface):
   def __init__(self, dbc_names, CP, CP_SP):
     CarControllerBase.__init__(self, dbc_names, CP, CP_SP)
+    self.nonacc_cluster_label = NonAccClusterLabel(CP)
     MadsCarController.__init__(self)
     GasInterceptorCarController.__init__(self, CP, CP_SP)
     IntelligentCruiseButtonManagementInterface.__init__(self, CP, CP_SP)
@@ -1296,7 +1332,8 @@ class CarController(CarControllerBase, MadsCarController, GasInterceptorCarContr
                               not self.CP_SP.enableGasInterceptor and not (self.CP_SP.flags & HondaFlagsSP.STOCK_LONGITUDINAL) else pcm_accel
           can_sends.append(hondacan.create_acc_hud(self.packer, self.CAN.pt, self.CP, CC.enabled, pcm_speed, acc_hud_pcm_accel,
                                                    hud_control, hud_v_cruise, CS.is_metric, CS.acc_hud, speed_control,
-                                                   self.CP.openpilotLongitudinalControl))
+                                                   self.CP.openpilotLongitudinalControl,
+                                                   conventional_cruise=self.nonacc_cluster_label.update(CS.out.cruiseState.nonAdaptive)))
 
       steering_available = CS.out.cruiseState.available and CS.out.vEgo > max(self.params.STEER_GLOBAL_MIN_SPEED, self.CP.minSteerSpeed)
       reduced_steering = CS.out.steeringPressed

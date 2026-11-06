@@ -617,7 +617,14 @@ RATE_MIN_WIRE = 0.25                              # normalized, |delayed wire| f
 # drive 00000135 the 5-10 m/s rows alone read "linear" against knees the 10-20 m/s rows show
 RATE_MIN_SPEED = 10.0                             # m/s
 RATE_MIN_SAMPLES = int(round(10.0 / DT_CTRL))     # counted ticks before the first fit (MDX town route 00000127: 14 s above 10 m/s)
-RATE_SCORE_INTERVAL = 5                           # ticks between fits
+RATE_SCORE_INTERVAL = 50                          # counted ticks between fits (was 5: see the note below)
+# civic-cruise session 14 (route 00000057, 1340 s and 1354 s): at 5 the two fits (_fit_wire: up to 8 projected-gradient
+# solves of 50 steps; _fit_delivery the same per speed class) ran on every 5th counted tick of a hard turn once a class
+# had its RATE_MIN_SAMPLES, ~12 ms each on the comma four inside card's 10 ms tick. carState fell to ~88 Hz for a
+# second and selfdrived raised "System Lagging". The statistics the fits read move with RATE_TAU, not per tick: in
+# whole-route replays from an empty learner, 50 against 5 changes the torque sent by at most 21 of 5120 counts on < 5 %
+# of frames and the learned values by < 0.005 (analysis/session14/fit_exact.py). WIRE_BOUND_HOLD_FITS is defined in
+# samples, so the hold is unchanged.
 RATE_MIN_RATE_STD = 2.0                           # deg/s, steer-rate spread over the samples before they are fitted
 # the fit has to explain a fair share of the steering before its shape is evidence: routes 00000139 and 00000127
 # fit at 0.46 / 0.76, the angle-PID drive 00000135 at 0.12-0.25 with a knee within 20% of its STEER_MAX
@@ -726,17 +733,34 @@ def _beyond_friction(dx, friction):
 
 
 def _pava_nonincreasing(values):
-  """Euclidean projection of a sequence onto {v_0 >= v_1 >= ... >= 0} (pool adjacent violators)."""
-  blocks = []
-  for v in values:
-    blocks.append([float(v), 1])
-    while len(blocks) > 1 and blocks[-2][0] < blocks[-1][0]:
-      v2, n2 = blocks.pop()
-      v1, n1 = blocks.pop()
-      blocks.append([(v1 * n1 + v2 * n2) / (n1 + n2), n1 + n2])
+  """Euclidean projection of a sequence onto {v_0 >= v_1 >= ... >= 0} (pool adjacent violators).
+
+  Runs 50 times per solve and up to 8 solves per fit inside card's 100 Hz loop, so it is written for speed: plain
+  floats, an early return when nothing violates the order, and two flat lists instead of a list of pairs. The
+  arithmetic and its order are those of the plain algorithm, so the result is bit-identical to it (civic-cruise
+  session 14: once a speed class had its 10 s of samples the fits ran every 5th counted tick of a hard turn, card
+  overran its 10 ms and selfdrived raised "System Lagging")."""
+  vals = values.tolist() if hasattr(values, "tolist") else [float(v) for v in values]
+  n = len(vals)
+  for i in range(n - 1):
+    if vals[i] < vals[i + 1]:
+      break
+  else:
+    return [max(v, 0.0) for v in vals]
+  bv = []
+  bn = []
+  for v in vals:
+    bv.append(v)
+    bn.append(1)
+    while len(bv) > 1 and bv[-2] < bv[-1]:
+      v2 = bv.pop()
+      n2 = bn.pop()
+      n1 = bn[-1]
+      bv[-1] = (bv[-1] * n1 + v2 * n2) / (n1 + n2)
+      bn[-1] = n1 + n2
   out = []
-  for v, n in blocks:
-    out.extend([max(v, 0.0)] * n)
+  for v, k in zip(bv, bn, strict=True):
+    out.extend([max(v, 0.0)] * k)
   return out
 
 

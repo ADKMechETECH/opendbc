@@ -181,3 +181,6 @@ class CarStateSP:
   # fork-only: the engine's own torque estimate at the wheels (Honda radarless: GAS_PEDAL_2.ENGINE_TORQUE_ESTIMATE),
   # N*m, negative = engine braking; NaN while not alive. Engine side only (never includes the service brakes).
   engineTorqueAxle: float = auto_field()
+  # fork-only: the car's own "brakes applied for the computer" flag (Honda: VSA_STATUS.COMPUTER_BRAKING). On while the
+  # VSA arms / applies the service brakes for an ACC request (brake lights on), never under the driver's pedal.
+  computerBraking: bool = auto_field()

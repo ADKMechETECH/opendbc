@@ -304,6 +304,9 @@ class CarState(CarStateBase, CarStateExt):
         ret.deprecated.engineRpm = rpm
         ret_sp.clutchPedal = self.clutch_pedal(cp)
         ret_sp.engineTorqueAxle = self.engine_torque_axle(cp)
+        # the car's own "braking for the computer" flag (0x1A4 bit 23): on for 100 % of openpilot's real braking, never
+        # under the driver's pedal, 0.05 % otherwise (route 0000005a, analysis/session15/brake_light_scan.py)
+        ret_sp.computerBraking = bool(cp.vl["VSA_STATUS"]["COMPUTER_BRAKING"])
         phantom = self.phantom_gear_guard.update(gear_mt, rpm, ret.vEgo)
         # clutchPressed = the drivetrain is decoupled: the pedal has left its top switch (the earliest cue, up to ~0.5 s
         # before GEAR_MT drops), or GEAR_MT has no gear (clutch in OR neutral with the clutch out), or a phantom gear.

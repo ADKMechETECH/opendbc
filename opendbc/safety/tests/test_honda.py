@@ -811,6 +811,37 @@ class TestHondaBoschRadarlessSafety(HondaPcmEnableBase, TestHondaBoschRadarlessS
     self.safety.init_tests()
 
 
+class TestHondaBoschRadarlessEpsBenchSafety(TestHondaBoschRadarlessSafety):
+  """
+    Covers the Honda Bosch Radarless safety mode with the debug-only EPS bench flag (bit 32): the stock radarless
+    TX set plus the raw CCP CRO 0x729 (8 bytes, any bus) for the EPS boot-catch recovery tool. Nothing else changes.
+  """
+  HONDA_PARAM_EPS_BENCH = 32  # honda.h, ALLOW_DEBUG only; unused bit in the main Honda safety param
+  TX_MSGS = TestHondaBoschRadarlessSafetyBase.TX_MSGS + [[0x729, 0], [0x729, 1], [0x729, 2]]
+
+  def setUp(self):
+    TestHondaBoschRadarlessSafetyBase.setUp(self)
+    self.safety.set_safety_hooks(CarParams.SafetyModel.hondaBosch, HondaSafetyFlags.RADARLESS | self.HONDA_PARAM_EPS_BENCH)
+    self.safety.init_tests()
+
+  def test_eps_bench_cro_tx(self):
+    cro = b"\x07" + b"\x00" * 7  # the boot-catch recognition frame
+    for bus in range(3):
+      for controls_allowed in (False, True):
+        self.safety.set_controls_allowed(controls_allowed)
+        self.assertTrue(self._tx(common.make_msg(bus, 0x729, 8, cro)), f"{bus=} {controls_allowed=}")
+        # DLC 8 only, and the reply id 0x724 is never a TX
+        self.assertFalse(self._tx(common.make_msg(bus, 0x729, 4)))
+        self.assertFalse(self._tx(common.make_msg(bus, 0x724, 8)))
+
+  def test_eps_bench_flag_required(self):
+    # the same param without bit 32 blocks 0x729 again
+    self.safety.set_safety_hooks(CarParams.SafetyModel.hondaBosch, HondaSafetyFlags.RADARLESS)
+    self.safety.init_tests()
+    for bus in range(3):
+      self.assertFalse(self._tx(common.make_msg(bus, 0x729, 8)))
+
+
 class TestHondaBoschRadarlessAltBrakeSafety(HondaPcmEnableBase, TestHondaBoschRadarlessSafetyBase, TestHondaBoschAltBrakeSafetyBase):
   """
     Covers the Honda Bosch Radarless safety mode with stock longitudinal and an alternate brake message

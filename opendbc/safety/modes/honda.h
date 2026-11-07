@@ -52,6 +52,12 @@ static bool honda_brake_switch_prev = false;
 static bool honda_alt_brake_msg = false;
 static bool honda_fwd_brake = false;
 static bool honda_bosch_long = false;
+#ifdef ALLOW_DEBUG
+// EPS bench (debug builds only, HONDA_PARAM_EPS_BENCH = 32, Bosch radarless): additionally whitelists raw TX of
+// 0x729 (the CCP CRO) so the EPS boot-catch recovery tool can flood/catch a hung Civic EPS through the panda.
+// TX whitelist only: RX checks, forwarding, relay checks and every actuation limit are unchanged.
+static bool honda_eps_bench = false;
+#endif
 static bool honda_bosch_radarless = false;
 static bool honda_bosch_canfd = false;
 static bool honda_nidec_hybrid = false;
@@ -534,6 +540,14 @@ static safety_config honda_bosch_init(uint16_t param) {
                                                   {0x30C, 0, 8, .check_relay = true}, {0x296, 2, 4, .check_relay = false}, {0x6CD5554, 0, 8, .check_relay = true},
                                                   {0xF31AA54, 0, 8, .check_relay = true}, {0x6CD5557, 0, 8, .check_relay = true}};  // Bosch radarless w/ gas and brakes
 
+#ifdef ALLOW_DEBUG
+  // HONDA_RADARLESS_TX_MSGS + the CCP CRO 0x729 (8 bytes, any bus: the recovery tool sweeps all three). check_relay off.
+  static CanMsg HONDA_RADARLESS_EPS_BENCH_TX_MSGS[] = {{0xE4, 0, 5, .check_relay = true}, {0x296, 2, 4, .check_relay = false}, {0x33D, 0, 8, .check_relay = true},
+                                                       {0x6CD5554, 0, 8, .check_relay = true}, {0xF31AA54, 0, 8, .check_relay = true},
+                                                       {0x6CD5557, 0, 8, .check_relay = true},
+                                                       {0x729, 0, 8, .check_relay = false}, {0x729, 1, 8, .check_relay = false}, {0x729, 2, 8, .check_relay = false}};
+#endif
+
   // 0x296 on bus 2: OP takes over SCM_BUTTONS towards the camera to auto-disable stock LKAS and to block
   // the driver's LKAS button while engaged (the physical SCM_BUTTONS is blocked from forwarding, see fwd hook)
   static CanMsg HONDA_CANFD_TX_MSGS[] = {{0xE4, 0, 5, .check_relay = true}, {0x296, 0, 4, .check_relay = false}, {0x296, 2, 4, .check_relay = false},
@@ -599,6 +613,9 @@ static safety_config honda_bosch_init(uint16_t param) {
 #ifdef ALLOW_DEBUG
   const uint16_t HONDA_PARAM_BOSCH_LONG = 2;
   honda_bosch_long = GET_FLAG(param, HONDA_PARAM_BOSCH_LONG);
+  // bit 32 is unused in the main Honda safety param (NIDEC_HYBRID lives in the SP param)
+  const uint16_t HONDA_PARAM_EPS_BENCH = 32;
+  honda_eps_bench = GET_FLAG(param, HONDA_PARAM_EPS_BENCH);
 #endif
 
   safety_config ret;
@@ -621,6 +638,10 @@ static safety_config honda_bosch_init(uint16_t param) {
   if (honda_bosch_radarless) {
     if (honda_bosch_long) {
       SET_TX_MSGS(HONDA_RADARLESS_LONG_TX_MSGS, ret);
+#ifdef ALLOW_DEBUG
+    } else if (honda_eps_bench) {
+      SET_TX_MSGS(HONDA_RADARLESS_EPS_BENCH_TX_MSGS, ret);
+#endif
     } else {
       SET_TX_MSGS(HONDA_RADARLESS_TX_MSGS, ret);
     }

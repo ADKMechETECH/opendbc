@@ -1049,6 +1049,10 @@ class SafetyTest(SafetyTestBase):
             if attr == 'TestVolkswagenMqbLongSafety' and current_test.startswith('TestHondaBoschRadarless'):
               tx = list(filter(lambda m: m[0] not in [0x30c, ], tx))
 
+            # ELM327's diagnostic range and the Honda EPS bench CCP CRO (0x729) overlap; it is not an actuating message
+            if attr == 'TestElm327' and current_test == 'TestHondaBoschRadarlessEpsBenchSafety':
+              tx = list(filter(lambda m: m[0] not in [0x729, ], tx))
+
             # Volkswagen MQB and Honda Bosch Canfd ACC HUD messages overlap
             if attr == 'TestVolkswagenMqbLongSafety' and current_test.startswith('TestHondaBoschCANFD'):
               tx = list(filter(lambda m: m[0] not in [0x30c, ], tx))
